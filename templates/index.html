@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spotify Playlist Merger</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">Spotify <span>Playlist Merger</span></div>
+  <div id="user-box" class="user-box hidden">
+    <img id="user-avatar" alt="" class="hidden">
+    <div id="user-avatar-fallback" class="avatar-fallback hidden"></div>
+    <span id="user-name"></span>
+    <button id="logout-btn" class="btn ghost small">Déconnexion</button>
+  </div>
+</header>
+
+<div id="banner" class="banner hidden"></div>
+
+<main>
+  <section id="view-setup" class="view hidden">
+    <div class="card wide">
+      <h1>Configuration</h1>
+      <p class="muted">Cette application locale fusionne vos playlists Spotify. Elle utilise OAuth 2.0 avec PKCE :
+      aucun mot de passe Spotify ne transite par cette application, et son code n'a besoin d'aucun secret.</p>
+      <ol class="steps">
+        <li>Ouvrez le <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener">Spotify Developer Dashboard</a> et connectez-vous.
+        Spotify exige un compte <strong>Premium</strong> pour les applications en mode développement.</li>
+        <li>Créez une application (« Create app »). Nom et description libres.</li>
+        <li>Dans les paramètres, ajoutez cette Redirect URI, exactement :
+          <div class="copy-row"><code id="redirect-uri-text">http://127.0.0.1:8888/callback</code>
+          <button id="copy-btn" class="btn ghost small" type="button">Copier</button></div>
+        </li>
+        <li>Enregistrez, puis copiez le <strong>Client ID</strong> et collez-le ci-dessous.</li>
+      </ol>
+      <form id="client-id-form" class="row">
+        <input id="client-id-input" type="text" placeholder="Votre Client ID Spotify" autocomplete="off" spellcheck="false">
+        <button class="btn" type="submit">Enregistrer</button>
+      </form>
+      <p class="muted small">Le Client ID est stocké uniquement en local dans <code>data/config.json</code>.</p>
+    </div>
+  </section>
+
+  <section id="view-login" class="view hidden">
+    <div class="card center">
+      <h1>Connexion à Spotify</h1>
+      <p class="muted">Autorisez l'application à lire vos playlists et à créer/modifier des playlists. Aucun mot de passe n'est demandé ici.</p>
+      <a href="/login" class="btn big">Se connecter avec Spotify</a>
+      <details class="change-id">
+        <summary>Changer de Client ID</summary>
+        <form id="client-id-form-2" class="row">
+          <input id="client-id-input-2" type="text" placeholder="Nouveau Client ID" autocomplete="off" spellcheck="false">
+          <button class="btn ghost" type="submit">Enregistrer</button>
+        </form>
+      </details>
+    </div>
+  </section>
+
+  <section id="view-merger" class="view hidden">
+    <div class="layout">
+      <div class="card playlists-card">
+        <h2>1 · Playlists à fusionner</h2>
+        <div class="toolbar">
+          <input id="filter" type="text" placeholder="Filtrer par nom…" autocomplete="off">
+          <label class="check-line"><input type="checkbox" id="select-all"> Tout sélectionner</label>
+        </div>
+        <p class="muted small"><span id="selection-count">0 sélectionnée</span></p>
+        <ul id="playlist-list" class="playlist-list"></ul>
+        <p class="muted small">Note : Spotify (mode développement) ne permet de lire que les playlists que vous possédez
+        ou auxquelles vous collaborez. Les playlists suivies par d'autres sont désactivées.</p>
+      </div>
+
+      <div class="card config-card">
+        <h2>2 · Playlist de destination</h2>
+        <label class="radio-line"><input type="radio" name="target-mode" value="new" checked> Créer une nouvelle playlist</label>
+        <div id="new-fields" class="field-group">
+          <input id="new-name" type="text" placeholder="Nom de la playlist" value="Ma playlist globale">
+          <input id="new-desc" type="text" placeholder="Description (optionnel)">
+          <label class="check-line"><input type="checkbox" id="new-public"> Playlist publique</label>
+        </div>
+        <label class="radio-line"><input type="radio" name="target-mode" value="existing"> Utiliser une playlist existante</label>
+        <div id="existing-fields" class="field-group hidden">
+          <select id="target-select"></select>
+          <p class="muted small">Seules vos playlists (ou collaborations) modifiables apparaissent ici.</p>
+        </div>
+
+        <h2>3 · Doublons</h2>
+        <label class="check-line"><input type="checkbox" id="opt-dedupe" checked> Retirer les doublons</label>
+        <label class="check-line indent"><input type="checkbox" id="opt-isrc"> Détecter aussi les mêmes morceaux (même ISRC, versions différentes)</label>
+        <label class="check-line"><input type="checkbox" id="opt-dry"> Simulation (ne rien modifier dans Spotify)</label>
+
+        <button id="start-btn" class="btn big full">Lancer la fusion</button>
+        <p id="start-error" class="error small hidden"></p>
+      </div>
+    </div>
+
+    <div id="progress-card" class="card hidden">
+      <h2>Fusion en cours…</h2>
+      <p id="progress-msg" class="muted">Préparation…</p>
+      <div class="bar"><div id="progress-fill" class="bar-fill"></div></div>
+      <p id="progress-detail" class="muted small"></p>
+      <button id="cancel-btn" class="btn ghost small">Annuler</button>
+    </div>
+
+    <div id="result-card" class="card hidden">
+      <h2 id="result-title">Résultat</h2>
+      <p id="result-sub" class="muted"></p>
+      <div id="result-stats" class="stats-grid"></div>
+      <p id="result-link-wrap" class="hidden"><a id="result-link" href="#" target="_blank" rel="noopener" class="btn">Ouvrir la playlist dans Spotify</a></p>
+      <details id="dup-details" class="hidden">
+        <summary>Voir les doublons ignorés</summary>
+        <ul id="dup-list"></ul>
+      </details>
+      <p id="skipped-wrap" class="muted small hidden"></p>
+      <button id="new-merge-btn" class="btn ghost">Nouvelle fusion</button>
+    </div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
