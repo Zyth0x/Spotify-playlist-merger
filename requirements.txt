@@ -3,3 +3,4 @@ requests>=2.28
 urllib3<2
 PyJWT>=2.8
 cryptography>=42
+ytmusicapi>=1.10,<2

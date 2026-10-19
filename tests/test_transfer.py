@@ -4,7 +4,14 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import perform_apple_transfer  # noqa: E402
+from app import perform_external_transfer  # noqa: E402
+from providers import (  # noqa: E402
+    AppleMusicDestination,
+    DeezerDestination,
+    YouTubeMusicDestination,
+    deezer_candidate,
+    youtube_candidate,
+)
 
 
 def make_track(index, isrc=None, title=None, artist="Artist"):
@@ -55,6 +62,27 @@ def song(song_id, name="Song", artist="Artist", isrc=None):
     return {"id": str(song_id), "type": "songs", "attributes": attributes}
 
 
+def deezer_track(track_id, name="Song", artist="Artist", isrc=None):
+    data = {
+        "id": track_id,
+        "title": name,
+        "artist": {"name": artist},
+        "duration": 200,
+    }
+    if isrc:
+        data["isrc"] = isrc
+    return data
+
+
+def youtube_track(video_id, name="Song", artist="Artist"):
+    return {
+        "videoId": video_id,
+        "title": name,
+        "artists": [{"name": artist}],
+        "duration_seconds": 200,
+    }
+
+
 class FakeApple:
     def __init__(self, by_isrc=None, by_term=None, existing=None):
         self.by_isrc = by_isrc or {}
@@ -90,8 +118,66 @@ class FakeApple:
         self.added_batches.append(list(song_ids))
 
 
-class AppleTransferTests(unittest.TestCase):
-    def test_new_playlist_matches_isrc_and_search(self):
+class FakeDeezer:
+    def __init__(self, by_isrc=None, by_term=None, existing=None):
+        self.by_isrc = by_isrc or {}
+        self.by_term = by_term or {}
+        self.existing = existing or {"ids": set(), "isrcs": set()}
+        self.created_name = None
+        self.created_description = None
+        self.added_batches = []
+
+    def playlist_existing_tracks(self, playlist_id):
+        return self.existing
+
+    def search_track_by_isrc(self, isrc):
+        return self.by_isrc.get(isrc.upper())
+
+    def search_tracks(self, term, limit=10):
+        return self.by_term.get(term, [])
+
+    def create_playlist(self, name, description=""):
+        self.created_name = name
+        self.created_description = description
+        return {"id": 42, "title": name}
+
+    def add_tracks(self, playlist_id, track_ids):
+        self.added_batches.append(list(track_ids))
+
+    def playlist_url(self, playlist_id):
+        return "https://www.deezer.com/playlist/{}".format(playlist_id)
+
+
+class FakeYouTube:
+    def __init__(self, by_term=None, existing=None):
+        self.by_term = by_term or {}
+        self.existing = existing or {"ids": set(), "isrcs": set()}
+        self.created_name = None
+        self.created_description = None
+        self.created_public = None
+        self.added_batches = []
+
+    def playlist_existing_tracks(self, playlist_id):
+        return self.existing
+
+    def search_tracks(self, term, limit=10):
+        return self.by_term.get(term, [])
+
+    def create_playlist(self, name, description="", public=False):
+        self.created_name = name
+        self.created_description = description
+        self.created_public = public
+        return {"id": "PLNEW", "attributes": {"name": name}}
+
+    def add_tracks(self, playlist_id, track_ids):
+        self.added_batches.append(list(track_ids))
+
+    def playlist_url(self, playlist_id):
+        return "https://music.youtube.com/playlist?list={}".format(playlist_id)
+
+
+class ExternalTransferTests(unittest.TestCase):
+    def test_apple_new_playlist_matches_isrc_and_search(self):
         apple = FakeApple(
             by_isrc={"ISRC1": song(101, "Song 1", "Artist", "ISRC1")},
             by_term={"Song 2 Artist": [song(102, "Song 2", "Artist")]},
@@ -101,25 +187,24 @@ class AppleTransferTests(unittest.TestCase):
             make_track(2, title="Song 2"),
             make_track(3, title="Unknown"),
         ]
-        job = make_job()
-        stats = make_stats()
-        result = perform_apple_transfer(
-            apple,
-            job,
+        result = perform_external_transfer(
+            AppleMusicDestination(apple),
+            make_job(),
             tracks,
             {"mode": "new", "name": "Transfert", "description": "Desc", "public": True},
             {"dedupe": True, "dedupe_isrc": False, "dry_run": False},
-            stats,
+            make_stats(),
             [],
         )
 
         self.assertEqual(apple.created_name, "Transfert")
         self.assertEqual(apple.created_description, "Desc")
         self.assertTrue(apple.created_public)
-        self.assertEqual(apple.created_song_ids, [])
         self.assertEqual(apple.added_batches, [["101", "102"]])
         self.assertEqual(result["added"], 2)
         self.assertTrue(result["created"])
+        self.assertEqual(result["provider"], "apple_music")
+        self.assertEqual(result["provider_label"], "Apple Music")
         self.assertEqual(result["playlist_id"], "p.NEW")
         self.assertEqual(result["stats"]["matched_isrc"], 1)
         self.assertEqual(result["stats"]["matched_search"], 1)
@@ -128,10 +213,9 @@ class AppleTransferTests(unittest.TestCase):
 
     def test_dry_run_changes_nothing(self):
         apple = FakeApple(by_isrc={"ISRC1": song(101, "Song 1", "Artist", "ISRC1")})
-        job = make_job()
-        result = perform_apple_transfer(
-            apple,
-            job,
+        result = perform_external_transfer(
+            AppleMusicDestination(apple),
+            make_job(),
             [make_track(1, isrc="ISRC1")],
             {"mode": "new", "name": "Brouillon"},
             {"dedupe": True, "dedupe_isrc": False, "dry_run": True},
@@ -155,8 +239,8 @@ class AppleTransferTests(unittest.TestCase):
             existing={"catalog_ids": {"101"}, "isrcs": {"ISRC1"}},
         )
         tracks = [make_track(1, isrc="ISRC1"), make_track(2, isrc="ISRC2")]
-        result = perform_apple_transfer(
-            apple,
+        result = perform_external_transfer(
+            AppleMusicDestination(apple),
             make_job(),
             tracks,
             {"mode": "existing", "id": "p.OLD", "name": "Ancienne"},
@@ -181,8 +265,8 @@ class AppleTransferTests(unittest.TestCase):
             tracks.append(make_track(index, isrc=isrc))
 
         apple = FakeApple(by_isrc=by_isrc)
-        result = perform_apple_transfer(
-            apple,
+        result = perform_external_transfer(
+            AppleMusicDestination(apple),
             make_job(),
             tracks,
             {"mode": "new", "name": "Grosse playlist"},
@@ -191,10 +275,91 @@ class AppleTransferTests(unittest.TestCase):
             [],
         )
 
-        self.assertEqual(apple.created_song_ids, [])
         self.assertEqual([len(batch) for batch in apple.added_batches], [100, 50])
         self.assertEqual(result["added"], 150)
         self.assertEqual(result["to_add"], 150)
+
+    def test_deezer_transfer_uses_isrc_then_search(self):
+        deezer = FakeDeezer(
+            by_isrc={"ISRC1": deezer_track(101, "Song 1", "Artist", "ISRC1")},
+            by_term={"Song 2 Artist": [deezer_track(102, "Song 2", "Artist")]},
+        )
+        tracks = [make_track(1, isrc="ISRC1"), make_track(2, title="Song 2")]
+        result = perform_external_transfer(
+            DeezerDestination(deezer),
+            make_job(),
+            tracks,
+            {"mode": "new", "name": "Deezer", "description": "Desc"},
+            {"dedupe": True, "dedupe_isrc": False, "dry_run": False},
+            make_stats(),
+            [],
+        )
+
+        self.assertEqual(deezer.created_name, "Deezer")
+        self.assertEqual(deezer.added_batches, [["101", "102"]])
+        self.assertEqual(result["provider"], "deezer")
+        self.assertEqual(result["playlist_url"], "https://www.deezer.com/playlist/42")
+        self.assertEqual(result["stats"]["matched_isrc"], 1)
+        self.assertEqual(result["stats"]["matched_search"], 1)
+        self.assertEqual(result["added"], 2)
+
+    def test_deezer_existing_playlist_dedupes_by_id(self):
+        deezer = FakeDeezer(
+            by_isrc={"ISRC2": deezer_track(102, "Song 2", "Artist", "ISRC2")},
+            existing={"ids": {"101"}, "isrcs": set()},
+        )
+        deezer.by_isrc["ISRC1"] = deezer_track(101, "Song 1", "Artist", "ISRC1")
+        result = perform_external_transfer(
+            DeezerDestination(deezer),
+            make_job(),
+            [make_track(1, isrc="ISRC1"), make_track(2, isrc="ISRC2")],
+            {"mode": "existing", "id": "999", "name": "Ancienne"},
+            {"dedupe": True, "dedupe_isrc": False, "dry_run": False},
+            make_stats(),
+            [],
+        )
+
+        self.assertEqual(result["stats"]["already_in_target"], 1)
+        self.assertEqual(deezer.added_batches, [["102"]])
+        self.assertEqual(result["playlist_id"], "999")
+
+    def test_youtube_transfer_matches_by_search(self):
+        youtube = FakeYouTube(
+            by_term={"Song Artist": [youtube_track("video1", "Song", "Artist")]}
+        )
+        result = perform_external_transfer(
+            YouTubeMusicDestination(youtube),
+            make_job(),
+            [make_track(1, title="Song")],
+            {"mode": "new", "name": "YT", "public": True},
+            {"dedupe": True, "dedupe_isrc": False, "dry_run": False},
+            make_stats(),
+            [],
+        )
+
+        self.assertEqual(youtube.created_name, "YT")
+        self.assertTrue(youtube.created_public)
+        self.assertEqual(youtube.added_batches, [["video1"]])
+        self.assertEqual(result["provider"], "youtube_music")
+        self.assertEqual(result["provider_label"], "YouTube Music")
+        self.assertEqual(result["stats"]["matched_search"], 1)
+        self.assertEqual(
+            result["playlist_url"],
+            "https://music.youtube.com/playlist?list=PLNEW",
+        )
+
+    def test_candidate_normalization(self):
+        deezer = deezer_candidate(deezer_track(1, "Song", "Artist", "ISRC"))
+        self.assertEqual(deezer["id"], "1")
+        self.assertEqual(deezer["attributes"]["name"], "Song")
+        self.assertEqual(deezer["attributes"]["artistName"], "Artist")
+        self.assertEqual(deezer["attributes"]["durationInMillis"], 200000)
+        self.assertEqual(deezer["attributes"]["isrc"], "ISRC")
+
+        youtube = youtube_candidate(youtube_track("video1", "Song", "Artist"))
+        self.assertEqual(youtube["id"], "video1")
+        self.assertEqual(youtube["attributes"]["artistName"], "Artist")
+        self.assertEqual(youtube["attributes"]["durationInMillis"], 200000)
 
 
 if __name__ == "__main__":

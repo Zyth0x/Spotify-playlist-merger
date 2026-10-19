@@ -2,6 +2,7 @@ import os
 import re
 import secrets
 import threading
+import time
 import uuid
 
 from flask import Flask, jsonify, redirect, render_template, request, session
@@ -13,7 +14,18 @@ from apple_client import (
     AppleMusicConfigError,
     validate_private_key,
 )
-from matching import pick_best_candidate
+from deezer_client import (
+    DeezerAPIError,
+    DeezerAuthError,
+    DeezerClient,
+    DeezerConfigError,
+    build_authorize_url as build_deezer_authorize_url,
+)
+from providers import (
+    AppleMusicDestination,
+    DeezerDestination,
+    YouTubeMusicDestination,
+)
 from spotify_client import (
     SpotifyAPIError,
     SpotifyAuthError,
@@ -23,6 +35,14 @@ from spotify_client import (
     load_json_file,
     save_json_file,
 )
+from youtube_client import (
+    YouTubeMusicAPIError,
+    YouTubeMusicAuthError,
+    YouTubeMusicClient,
+    YouTubeMusicConfigError,
+    poll_device_authorization,
+    start_device_authorization,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -30,19 +50,24 @@ CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 TOKENS_PATH = os.path.join(DATA_DIR, "tokens.json")
 APPLE_KEY_PATH = os.path.join(DATA_DIR, "apple_key.p8")
 APPLE_TOKENS_PATH = os.path.join(DATA_DIR, "apple_tokens.json")
+DEEZER_TOKENS_PATH = os.path.join(DATA_DIR, "deezer_tokens.json")
+YOUTUBE_TOKEN_PATH = os.path.join(DATA_DIR, "ytmusic_oauth.json")
 
 HOST = "127.0.0.1"
 PORT = 8888
 ORIGIN = "http://{}:{}".format(HOST, PORT)
 APPLE_ORIGINS = [ORIGIN, "http://localhost:{}".format(PORT)]
 REDIRECT_URI = ORIGIN + "/callback"
+DEEZER_REDIRECT_URI = ORIGIN + "/deezer/callback"
 
 BATCH_SIZE = 100
-APPLE_BATCH_SIZE = 100
 MAX_PLAYLIST_ITEMS = 10000
 DUP_PREVIEW_LIMIT = 50
 
-TARGET_PROVIDERS = ("spotify", "apple_music")
+TARGET_PROVIDERS = ("spotify", "apple_music", "deezer", "youtube_music")
+YOUTUBE_FLOWS = {}
+YOUTUBE_FLOWS_LOCK = threading.Lock()
+YOUTUBE_FLOW_TTL = 1800
 
 
 class MergeError(Exception):
@@ -79,6 +104,24 @@ def get_apple_client():
     return AppleMusicClient(load_config(), APPLE_KEY_PATH, APPLE_TOKENS_PATH, APPLE_ORIGINS)
 
 
+def get_deezer_client():
+    return DeezerClient(load_config(), DEEZER_TOKENS_PATH)
+
+
+def get_youtube_client():
+    return YouTubeMusicClient(load_config(), YOUTUBE_TOKEN_PATH)
+
+
+def get_destination_adapter(provider):
+    if provider == "apple_music":
+        return AppleMusicDestination(get_apple_client())
+    if provider == "deezer":
+        return DeezerDestination(get_deezer_client())
+    if provider == "youtube_music":
+        return YouTubeMusicDestination(get_youtube_client())
+    raise ValueError("Fournisseur de destination inconnu : {}".format(provider))
+
+
 def track_label(item):
     artists = ", ".join(a.get("name", "") for a in item.get("artists") or [])
     name = item.get("name") or item.get("uri") or "?"
@@ -100,16 +143,29 @@ def apple_public_state(client):
     }
 
 
+def deezer_public_state(client):
+    return {
+        "configured": client.is_configured(),
+        "authenticated": client.is_authenticated(),
+        "app_id": client.app_id or None,
+        "redirect_uri": DEEZER_REDIRECT_URI,
+    }
+
+
+def youtube_public_state(client):
+    return {
+        "configured": client.is_configured(),
+        "authenticated": client.is_authenticated(),
+        "client_id": client.client_id or None,
+    }
+
+
 def apple_artwork(attributes):
     artwork = attributes.get("artwork") or {}
     url = artwork.get("url")
     if not url:
         return None
     return url.replace("{w}x{h}", "60x60")
-
-
-def apple_playlist_url(playlist_id):
-    return "https://music.apple.com/library/playlist/{}".format(playlist_id)
 
 
 @app.route("/")
@@ -142,11 +198,15 @@ def api_state():
                     authenticated = False
 
     apple = apple_public_state(get_apple_client())
+    deezer = deezer_public_state(get_deezer_client())
+    youtube = youtube_public_state(get_youtube_client())
     return jsonify({
         "has_client_id": bool(client_id),
         "authenticated": authenticated,
         "me": me,
         "apple": apple,
+        "deezer": deezer,
+        "youtube_music": youtube,
         "providers": {
             "spotify": {
                 "configured": bool(client_id),
@@ -154,6 +214,8 @@ def api_state():
                 "me": me,
             },
             "apple_music": apple,
+            "deezer": deezer,
+            "youtube_music": youtube,
         },
     })
 
@@ -391,6 +453,281 @@ def api_apple_playlists():
     return jsonify({"playlists": playlists})
 
 
+# -------------------------------------------------------------------- Deezer
+
+
+@app.route("/api/deezer/config", methods=["POST"])
+def api_deezer_config():
+    data = request.get_json(silent=True) or {}
+    app_id = str(data.get("app_id") or "").strip()
+    app_secret = str(data.get("app_secret") or "").strip()
+    if not app_id or len(app_id) > 64 or " " in app_id:
+        return jsonify({"error": "App ID Deezer invalide."}), 400
+    if not app_secret or len(app_secret) > 128 or " " in app_secret:
+        return jsonify({"error": "App Secret Deezer invalide."}), 400
+
+    previous = load_config().get("deezer") or {}
+    update_config({"deezer": {"app_id": app_id, "app_secret": app_secret}})
+    if (previous.get("app_id"), previous.get("app_secret")) != (app_id, app_secret):
+        try:
+            os.remove(DEEZER_TOKENS_PATH)
+        except OSError:
+            pass
+    client = get_deezer_client()
+    return jsonify({"ok": True, "deezer": deezer_public_state(client)})
+
+
+@app.route("/deezer/login")
+def deezer_login():
+    client = get_deezer_client()
+    if not client.is_configured():
+        return redirect("/?deezer_error=config&provider=deezer")
+    state = secrets.token_urlsafe(24)
+    session["deezer_oauth_state"] = state
+    return redirect(
+        build_deezer_authorize_url(client.app_id, DEEZER_REDIRECT_URI, state)
+    )
+
+
+@app.route("/deezer/callback")
+def deezer_callback():
+    if request.args.get("error"):
+        return redirect("/?deezer_error=denied&provider=deezer")
+    code = request.args.get("code")
+    state = request.args.get("state")
+    expected_state = session.pop("deezer_oauth_state", None)
+    if not code or (expected_state and state != expected_state):
+        return redirect("/?deezer_error=state&provider=deezer")
+    try:
+        get_deezer_client().exchange_code(code, DEEZER_REDIRECT_URI)
+    except (DeezerAuthError, DeezerConfigError):
+        return redirect("/?deezer_error=auth&provider=deezer")
+    return redirect("/?deezer_connected=1&provider=deezer")
+
+
+@app.route("/api/deezer/logout", methods=["POST"])
+def api_deezer_logout():
+    get_deezer_client().logout()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/deezer/playlists")
+def api_deezer_playlists():
+    client = get_deezer_client()
+    if not client.is_configured():
+        return jsonify({"error": "Deezer n'est pas encore configuré."}), 400
+    if not client.is_authenticated():
+        return jsonify({"error": "Compte Deezer non connecté."}), 401
+    try:
+        raw_playlists = client.all_playlists()
+    except DeezerAuthError as exc:
+        return jsonify({"error": str(exc)}), 401
+    except DeezerConfigError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except DeezerAPIError as exc:
+        return jsonify({"error": exc.message}), 502
+
+    playlists = []
+    for playlist in raw_playlists:
+        playlists.append({
+            "id": str(playlist.get("id")),
+            "name": playlist.get("title") or "(sans titre)",
+            "track_count": playlist.get("nb_tracks"),
+            "can_edit": True,
+            "image": playlist.get("picture_medium") or playlist.get("picture_small"),
+        })
+    return jsonify({"playlists": playlists})
+
+
+# ------------------------------------------------------------- YouTube Music
+
+
+@app.route("/api/youtube/config", methods=["POST"])
+def api_youtube_config():
+    data = request.get_json(silent=True) or {}
+    client_id = str(data.get("client_id") or "").strip()
+    client_secret = str(data.get("client_secret") or "").strip()
+    if not client_id or len(client_id) > 256 or " " in client_id:
+        return jsonify({"error": "Client ID Google invalide."}), 400
+    if not client_secret or len(client_secret) > 256 or " " in client_secret:
+        return jsonify({"error": "Client Secret Google invalide."}), 400
+
+    previous = load_config().get("youtube_music") or {}
+    update_config({
+        "youtube_music": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+        }
+    })
+    if (previous.get("client_id"), previous.get("client_secret")) != (
+        client_id,
+        client_secret,
+    ):
+        try:
+            os.remove(YOUTUBE_TOKEN_PATH)
+        except OSError:
+            pass
+    client = get_youtube_client()
+    return jsonify({"ok": True, "youtube_music": youtube_public_state(client)})
+
+
+@app.route("/api/youtube/device", methods=["POST"])
+def api_youtube_device():
+    client = get_youtube_client()
+    if not client.is_configured():
+        return jsonify({"error": "YouTube Music n'est pas encore configuré."}), 400
+    try:
+        code = start_device_authorization(client.client_id, client.client_secret)
+    except YouTubeMusicConfigError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except YouTubeMusicAPIError as exc:
+        return jsonify({"error": exc.message}), 502
+
+    flow_id = uuid.uuid4().hex
+    now = time.time()
+    try:
+        interval = max(1, int(code.get("interval", 5)))
+    except (TypeError, ValueError):
+        interval = 5
+    try:
+        expires_in = max(60, int(code.get("expires_in", YOUTUBE_FLOW_TTL)))
+    except (TypeError, ValueError):
+        expires_in = YOUTUBE_FLOW_TTL
+    flow = {
+        "device_code": code.get("device_code"),
+        "interval": interval,
+        "expires_at": now + expires_in,
+        "client_id": client.client_id,
+        "client_secret": client.client_secret,
+        "last_poll": 0.0,
+    }
+    if not flow["device_code"]:
+        return jsonify({"error": "Google n'a pas renvoyé de code d'autorisation."}), 502
+
+    with YOUTUBE_FLOWS_LOCK:
+        YOUTUBE_FLOWS[flow_id] = flow
+        for old_id, old_flow in list(YOUTUBE_FLOWS.items()):
+            if old_flow["expires_at"] < now:
+                YOUTUBE_FLOWS.pop(old_id, None)
+
+    return jsonify({
+        "flow_id": flow_id,
+        "user_code": code.get("user_code"),
+        "verification_url": code.get("verification_url"),
+        "interval": interval,
+        "expires_in": expires_in,
+    })
+
+
+@app.route("/api/youtube/device/status")
+def api_youtube_device_status():
+    flow_id = request.args.get("flow_id") or ""
+    with YOUTUBE_FLOWS_LOCK:
+        flow = dict(YOUTUBE_FLOWS.get(flow_id) or {})
+    if not flow:
+        return jsonify({"error": "Autorisation YouTube Music introuvable ou expirée."}), 404
+
+    now = time.time()
+    if now >= flow["expires_at"]:
+        with YOUTUBE_FLOWS_LOCK:
+            YOUTUBE_FLOWS.pop(flow_id, None)
+        return jsonify({"status": "expired", "error": "Le code d'autorisation a expiré."}), 400
+
+    with YOUTUBE_FLOWS_LOCK:
+        current = YOUTUBE_FLOWS.get(flow_id)
+        if current is None:
+            return jsonify({"status": "expired", "error": "Autorisation expirée."}), 400
+        if now - current["last_poll"] < current["interval"]:
+            return jsonify({"status": "pending"})
+        current["last_poll"] = now
+        interval = current["interval"]
+
+    try:
+        data = poll_device_authorization(
+            flow["client_id"], flow["client_secret"], flow["device_code"]
+        )
+    except YouTubeMusicAPIError as exc:
+        return jsonify({"status": "error", "error": exc.message}), 502
+
+    error = data.get("error") if isinstance(data, dict) else "invalid_response"
+    if error == "authorization_pending":
+        return jsonify({"status": "pending"})
+    if error == "slow_down":
+        with YOUTUBE_FLOWS_LOCK:
+            current = YOUTUBE_FLOWS.get(flow_id)
+            if current:
+                current["interval"] = current.get("interval", interval) + 5
+        return jsonify({"status": "pending"})
+    if error:
+        with YOUTUBE_FLOWS_LOCK:
+            YOUTUBE_FLOWS.pop(flow_id, None)
+        messages = {
+            "access_denied": "Autorisation refusée par l'utilisateur.",
+            "expired_token": "Le code d'autorisation a expiré.",
+            "invalid_grant": "Code d'autorisation invalide.",
+        }
+        return jsonify({
+            "status": "error",
+            "error": messages.get(str(error), str(error)),
+        }), 400
+    if not data.get("access_token"):
+        with YOUTUBE_FLOWS_LOCK:
+            YOUTUBE_FLOWS.pop(flow_id, None)
+        return jsonify({"status": "error", "error": "Réponse d'autorisation invalide."}), 502
+
+    expires_in = int(data.get("expires_in", 3600))
+    token = {
+        "scope": data.get("scope", "https://www.googleapis.com/auth/youtube"),
+        "token_type": data.get("token_type", "Bearer"),
+        "access_token": data["access_token"],
+        "refresh_token": data.get("refresh_token", ""),
+        "expires_at": int(time.time()) + expires_in,
+        "expires_in": expires_in,
+    }
+    save_json_file(YOUTUBE_TOKEN_PATH, token)
+    with YOUTUBE_FLOWS_LOCK:
+        YOUTUBE_FLOWS.pop(flow_id, None)
+
+    client = get_youtube_client()
+    return jsonify({"status": "done", "youtube_music": youtube_public_state(client)})
+
+
+@app.route("/api/youtube/logout", methods=["POST"])
+def api_youtube_logout():
+    get_youtube_client().logout()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/youtube/playlists")
+def api_youtube_playlists():
+    client = get_youtube_client()
+    if not client.is_configured():
+        return jsonify({"error": "YouTube Music n'est pas encore configuré."}), 400
+    if not client.is_authenticated():
+        return jsonify({"error": "Compte YouTube Music non connecté."}), 401
+    try:
+        raw_playlists = client.all_playlists()
+    except YouTubeMusicAuthError as exc:
+        return jsonify({"error": str(exc)}), 401
+    except YouTubeMusicConfigError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except YouTubeMusicAPIError as exc:
+        return jsonify({"error": exc.message}), 502
+
+    playlists = []
+    for playlist in raw_playlists:
+        thumbnails = playlist.get("thumbnails") or []
+        image = thumbnails[-1].get("url") if thumbnails else None
+        playlists.append({
+            "id": playlist.get("playlistId"),
+            "name": playlist.get("title") or "(sans titre)",
+            "track_count": playlist.get("count"),
+            "can_edit": True,
+            "image": image,
+        })
+    return jsonify({"playlists": playlists})
+
+
 # --------------------------------------------------------------------- merge
 
 
@@ -414,13 +751,24 @@ def api_merge():
     if mode == "existing" and not target.get("id"):
         return jsonify({"error": "Choisissez une playlist existante."}), 400
 
-    apple = None
     if provider == "apple_music":
         apple = get_apple_client()
         if not apple.is_configured():
             return jsonify({"error": "Configurez d'abord Apple Music (Team ID, Key ID et clé .p8)."}), 400
         if not apple.is_authenticated():
             return jsonify({"error": "Connectez votre compte Apple Music avant de lancer le transfert."}), 401
+    elif provider == "deezer":
+        deezer = get_deezer_client()
+        if not deezer.is_configured():
+            return jsonify({"error": "Configurez d'abord votre application Deezer (App ID et App Secret)."}), 400
+        if not deezer.is_authenticated():
+            return jsonify({"error": "Connectez votre compte Deezer avant de lancer le transfert."}), 401
+    elif provider == "youtube_music":
+        youtube = get_youtube_client()
+        if not youtube.is_configured():
+            return jsonify({"error": "Configurez d'abord YouTube Music (Client ID et Client Secret Google)."}), 400
+        if not youtube.is_authenticated():
+            return jsonify({"error": "Connectez votre compte YouTube Music avant de lancer le transfert."}), 401
 
     raw_options = data.get("options") or {}
     options = {
@@ -512,9 +860,13 @@ def api_merge_cancel(job_id):
 def run_merge(job_id, client_id, provider, sources, target, options):
     job = JOBS[job_id]
     client = SpotifyClient(client_id, TOKENS_PATH)
-    apple = get_apple_client() if provider == "apple_music" else None
+    destination = None
     try:
-        result = perform_merge(client, apple, job, provider, sources, target, options)
+        if provider != "spotify":
+            destination = get_destination_adapter(provider)
+        result = perform_merge(
+            client, destination, job, provider, sources, target, options
+        )
         job["result"] = result
         job["status"] = "cancelled" if job["cancel"] else "done"
         job["message"] = "Terminé."
@@ -533,6 +885,24 @@ def run_merge(job_id, client_id, provider, sources, target, options):
     except AppleMusicAPIError as exc:
         job["status"] = "error"
         job["error"] = "Erreur Apple Music ({}): {}".format(exc.status, exc.message)
+    except DeezerAuthError as exc:
+        job["status"] = "error"
+        job["error"] = str(exc)
+    except DeezerConfigError as exc:
+        job["status"] = "error"
+        job["error"] = str(exc)
+    except DeezerAPIError as exc:
+        job["status"] = "error"
+        job["error"] = "Erreur Deezer ({}): {}".format(exc.status, exc.message)
+    except YouTubeMusicAuthError as exc:
+        job["status"] = "error"
+        job["error"] = str(exc)
+    except YouTubeMusicConfigError as exc:
+        job["status"] = "error"
+        job["error"] = str(exc)
+    except YouTubeMusicAPIError as exc:
+        job["status"] = "error"
+        job["error"] = "Erreur YouTube Music ({}): {}".format(exc.status, exc.message)
     except MergeError as exc:
         job["status"] = "error"
         job["error"] = str(exc)
@@ -541,11 +911,15 @@ def run_merge(job_id, client_id, provider, sources, target, options):
         job["error"] = "Erreur inattendue : {}".format(exc)
 
 
-def perform_merge(client, apple, job, provider, sources, target, options):
+def perform_merge(client, destination, job, provider, sources, target, options):
     tracks, stats, dup_preview = collect_tracks(client, job, sources, options)
-    if provider == "apple_music":
-        return perform_apple_transfer(apple, job, tracks, target, options, stats, dup_preview)
-    return perform_spotify_merge(client, job, tracks, target, options, stats, dup_preview)
+    if provider == "spotify":
+        return perform_spotify_merge(
+            client, job, tracks, target, options, stats, dup_preview
+        )
+    return perform_external_transfer(
+        destination, job, tracks, target, options, stats, dup_preview
+    )
 
 
 def collect_tracks(client, job, sources, options):
@@ -640,6 +1014,7 @@ def perform_spotify_merge(client, job, tracks, target, options, stats, dup_previ
     if job["cancel"]:
         return {
             "provider": "spotify",
+            "provider_label": "Spotify",
             "created": False,
             "dry_run": options["dry_run"],
             "playlist_id": None,
@@ -695,6 +1070,7 @@ def perform_spotify_merge(client, job, tracks, target, options, stats, dup_previ
 
     result = {
         "provider": "spotify",
+        "provider_label": "Spotify",
         "created": created,
         "dry_run": options["dry_run"],
         "playlist_id": target_id,
@@ -723,57 +1099,33 @@ def perform_spotify_merge(client, job, tracks, target, options, stats, dup_previ
     return result
 
 
-def resolve_apple_song(apple, track):
-    """Retourne (morceau Apple Music, méthode) ou (None, None)."""
-    isrc = (track.get("isrc") or "").strip()
-    if isrc:
-        try:
-            song = apple.search_song_by_isrc(isrc)
-            if song:
-                return song, "isrc"
-        except (AppleMusicAuthError, AppleMusicConfigError):
-            raise
-        except AppleMusicAPIError as exc:
-            if exc.status in (401, 403, 429) or exc.status >= 500:
-                raise
-
-    term = "{} {}".format(
-        track.get("title") or "",
-        (track.get("artists") or [""])[0],
-    ).strip()
-    if not term:
-        return None, None
-    candidates = apple.search_songs(term, limit=10)
-    song, _score = pick_best_candidate(track, candidates)
-    if song:
-        return song, "search"
-    return None, None
-
-
-def perform_apple_transfer(apple, job, tracks, target, options, stats, dup_preview):
+def perform_external_transfer(
+    adapter, job, tracks, target, options, stats, dup_preview
+):
+    """Transfère des morceaux Spotify vers un fournisseur externe."""
     unmatched_preview = []
-    existing = {"catalog_ids": set(), "isrcs": set()}
+    existing = {"ids": set(), "isrcs": set()}
     target_id = None
     playlist_name = target.get("name") or ""
 
     if target["mode"] == "existing":
         target_id = target["id"]
-        job["message"] = "Lecture de la playlist Apple Music cible…"
+        job["message"] = "Lecture de la playlist {} cible…".format(adapter.label)
         try:
-            existing = apple.playlist_existing_tracks(target_id)
-        except AppleMusicAuthError:
-            raise
-        except AppleMusicAPIError as exc:
-            if exc.status in (403, 404):
+            existing = adapter.existing_tracks(target_id)
+        except Exception as exc:  # noqa: BLE001 - erreurs normalisées ci-dessous
+            status = getattr(exc, "status", None)
+            if status in (403, 404, 800):
                 raise MergeError(
-                    "Impossible de lire la playlist Apple Music cible. Vérifiez qu'elle existe dans votre bibliothèque."
+                    "Impossible de lire la playlist {} cible. Vérifiez qu'elle existe "
+                    "dans votre bibliothèque.".format(adapter.label)
                 )
             raise
-        playlist_name = target.get("name") or "Playlist Apple Music"
+        playlist_name = target.get("name") or "Playlist {}".format(adapter.label)
 
     cache = {}
-    song_ids = []
-    seen_song_ids = set()
+    destination_ids = []
+    seen_destination_ids = set()
     total = len(tracks)
     job["phase"] = "match"
     job["progress"] = {"done": 0, "total": total}
@@ -790,23 +1142,24 @@ def perform_apple_transfer(apple, job, tracks, target, options, stats, dup_previ
             )
         )
         if cache_key in cache:
-            song, method = cache[cache_key]
+            destination_id, method = cache[cache_key]
         else:
-            song, method = resolve_apple_song(apple, track)
-            cache[cache_key] = (song, method)
+            destination_id, method = adapter.resolve_track(track)
+            cache[cache_key] = (destination_id, method)
 
-        if song:
+        if destination_id:
             stats["matched_isrc" if method == "isrc" else "matched_search"] += 1
-            song_id = str(song.get("id"))
             isrc = (track.get("isrc") or "").upper()
-            already = song_id in existing["catalog_ids"] or (isrc and isrc in existing["isrcs"])
+            already = destination_id in existing["ids"] or (
+                isrc and isrc in existing["isrcs"]
+            )
             if options["dedupe"] and already:
                 stats["already_in_target"] += 1
-            elif options["dedupe"] and song_id in seen_song_ids:
+            elif options["dedupe"] and destination_id in seen_destination_ids:
                 stats["duplicates"] += 1
             else:
-                song_ids.append(song_id)
-                seen_song_ids.add(song_id)
+                destination_ids.append(destination_id)
+                seen_destination_ids.add(destination_id)
         else:
             stats["unmatched"] += 1
             if len(unmatched_preview) < DUP_PREVIEW_LIMIT:
@@ -814,18 +1167,19 @@ def perform_apple_transfer(apple, job, tracks, target, options, stats, dup_previ
 
         job["progress"]["done"] = index + 1
         if index % 3 == 0 or index + 1 == total:
-            job["message"] = "Recherche sur Apple Music… {}/{} · {} trouvé(s)".format(
-                index + 1, total, len(song_ids)
+            job["message"] = "Recherche sur {}… {}/{} · {} trouvé(s)".format(
+                adapter.label, index + 1, total, len(destination_ids)
             )
 
     result = {
-        "provider": "apple_music",
+        "provider": adapter.provider_id,
+        "provider_label": adapter.label,
         "created": False,
         "dry_run": options["dry_run"],
         "playlist_id": target_id,
-        "playlist_url": apple_playlist_url(target_id) if target_id else None,
+        "playlist_url": adapter.playlist_url(target_id) if target_id else None,
         "playlist_name": playlist_name,
-        "to_add": len(song_ids),
+        "to_add": len(destination_ids),
         "added": 0,
         "stats": stats,
         "dup_preview": dup_preview,
@@ -836,41 +1190,45 @@ def perform_apple_transfer(apple, job, tracks, target, options, stats, dup_previ
         return result
 
     if target["mode"] == "new":
-        if not song_ids:
+        if not destination_ids:
             raise MergeError(
-                "Aucun morceau n'a pu être trouvé sur Apple Music : la playlist serait vide."
+                "Aucun morceau n'a pu être trouvé sur {} : la playlist serait vide.".format(
+                    adapter.label
+                )
             )
         job["phase"] = "target"
-        job["message"] = "Création de la playlist « {} » sur Apple Music…".format(
-            target["name"].strip()
+        job["message"] = "Création de la playlist « {} » sur {}…".format(
+            target["name"].strip(), adapter.label
         )
-        created_playlist = apple.create_playlist(
+        created_playlist = adapter.create_playlist(
             target["name"].strip(),
             (target.get("description") or "").strip(),
             bool(target.get("public")),
         )
         target_id = created_playlist.get("id")
         if not target_id:
-            raise MergeError("Apple Music n'a pas renvoyé l'identifiant de la playlist créée.")
+            raise MergeError(
+                "{} n'a pas renvoyé l'identifiant de la playlist créée.".format(
+                    adapter.label
+                )
+            )
         result["created"] = True
         result["playlist_id"] = target_id
-        result["playlist_url"] = apple_playlist_url(target_id)
-        result["playlist_name"] = (
-            (created_playlist.get("attributes") or {}).get("name")
-            or target["name"]
-        )
-    remaining = song_ids
+        result["playlist_url"] = adapter.playlist_url(target_id)
+        result["playlist_name"] = created_playlist.get("name") or target["name"]
 
     job["phase"] = "add"
-    job["progress"] = {"done": job["added"], "total": len(song_ids)}
-    job["message"] = "Ajout des morceaux… {}/{}".format(job["added"], len(song_ids))
-    for batch in chunks(remaining, APPLE_BATCH_SIZE):
+    job["progress"] = {"done": 0, "total": len(destination_ids)}
+    job["message"] = "Ajout des morceaux… 0/{}".format(len(destination_ids))
+    for batch in chunks(destination_ids, adapter.batch_size):
         if job["cancel"]:
             break
-        apple.add_tracks(target_id, batch)
+        adapter.add_tracks(target_id, batch)
         job["added"] += len(batch)
         job["progress"]["done"] = job["added"]
-        job["message"] = "Ajout des morceaux… {}/{}".format(job["added"], len(song_ids))
+        job["message"] = "Ajout des morceaux… {}/{}".format(
+            job["added"], len(destination_ids)
+        )
 
     result["added"] = job["added"]
     return result

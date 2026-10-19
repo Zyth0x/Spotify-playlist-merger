@@ -24,9 +24,9 @@
   <section id="view-setup" class="view hidden">
     <div class="card wide">
       <h1>Configuration</h1>
-      <p class="muted">Cette application locale fusionne vos playlists Spotify et peut les transférer vers Apple Music.
-      Elle utilise OAuth 2.0 avec PKCE : aucun mot de passe Spotify ne transite par cette application, et son code
-      n'a besoin d'aucun secret.</p>
+      <p class="muted">Cette application locale fusionne vos playlists Spotify et peut les transférer vers
+      Apple Music, Deezer ou YouTube Music. Elle utilise OAuth 2.0 avec PKCE pour Spotify : aucun mot de passe
+      Spotify ne transite par cette application, et son code n'a besoin d'aucun secret.</p>
       <ol class="steps">
         <li>Ouvrez le <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener">Spotify Developer Dashboard</a> et connectez-vous.
         Spotify exige un compte <strong>Premium</strong> pour les applications en mode développement.</li>
@@ -87,7 +87,19 @@
             <span class="provider-name">Apple Music</span>
             <span class="provider-sub">Transférer vers Apple Music</span>
           </label>
+          <label class="provider-option">
+            <input type="radio" name="target-provider" value="deezer">
+            <span class="provider-name">Deezer</span>
+            <span class="provider-sub">Transférer vers Deezer</span>
+          </label>
+          <label class="provider-option">
+            <input type="radio" name="target-provider" value="youtube_music">
+            <span class="provider-name">YouTube Music</span>
+            <span class="provider-sub">Transférer vers YouTube Music</span>
+          </label>
         </div>
+        <p class="muted small">Amazon Music et Tidal ne sont pas proposés : leurs API de gestion de
+        playlists nécessitent un accès partenaire spécifique.</p>
 
         <div id="provider-spotify">
           <label class="radio-line"><input type="radio" name="spotify-target-mode" value="new" checked> Créer une nouvelle playlist</label>
@@ -171,6 +183,124 @@
           </div>
         </div>
 
+        <div id="provider-deezer" class="hidden">
+          <p class="muted small">Deezer utilise OAuth : créez une application sur le
+          <a href="https://developers.deezer.com/" target="_blank" rel="noopener">portail développeur Deezer</a>,
+          puis autorisez votre compte. Chaque morceau est recherché par ISRC, puis par titre et artiste.</p>
+
+          <div id="deezer-setup" class="provider-box hidden">
+            <details id="deezer-setup-details" class="setup-details">
+              <summary>Configuration Deezer</summary>
+              <form id="deezer-config-form" class="apple-form">
+                <label>App ID
+                  <input id="deezer-app-id" type="text" placeholder="123456" autocomplete="off" spellcheck="false">
+                </label>
+                <label>App Secret
+                  <input id="deezer-app-secret" type="password" placeholder="Votre App Secret" autocomplete="off">
+                </label>
+                <p class="muted small">Redirect URI à déclarer dans l'application Deezer :
+                  <code id="deezer-redirect-uri">http://127.0.0.1:8888/deezer/callback</code>
+                </p>
+                <button class="btn" type="submit">Enregistrer la configuration</button>
+                <p class="muted small">L'App Secret est stocké localement dans <code>data/config.json</code>.</p>
+              </form>
+            </details>
+          </div>
+
+          <div id="deezer-connect" class="provider-box hidden">
+            <p class="muted small">Configuration enregistrée. Autorisez l'application à gérer vos playlists Deezer.</p>
+            <div class="row">
+              <a id="deezer-connect-btn" class="btn" href="/deezer/login">Se connecter à Deezer</a>
+              <button id="deezer-reconfigure-btn" class="btn ghost" type="button">Reconfigurer</button>
+            </div>
+          </div>
+
+          <div id="deezer-connected" class="provider-box hidden">
+            <p class="muted small">Connecté à Deezer.</p>
+            <div class="row">
+              <button id="deezer-disconnect-btn" class="btn ghost small" type="button">Déconnecter Deezer</button>
+              <button id="deezer-reconfigure-btn-2" class="btn ghost small" type="button">Reconfigurer</button>
+            </div>
+          </div>
+
+          <div id="deezer-target" class="hidden">
+            <label class="radio-line"><input type="radio" name="deezer-target-mode" value="new" checked> Créer une nouvelle playlist</label>
+            <div id="deezer-new-fields" class="field-group">
+              <input id="deezer-new-name" type="text" placeholder="Nom de la playlist" value="Ma playlist Deezer">
+              <input id="deezer-new-desc" type="text" placeholder="Description (optionnel)">
+            </div>
+            <label class="radio-line"><input type="radio" name="deezer-target-mode" value="existing"> Utiliser une playlist Deezer existante</label>
+            <div id="deezer-existing-fields" class="field-group hidden">
+              <select id="deezer-target-select"></select>
+              <p class="muted small">Vos playlists Deezer modifiables.</p>
+            </div>
+            <p class="muted small">Les morceaux introuvables sont ignorés et listés dans le résultat.</p>
+          </div>
+        </div>
+
+        <div id="provider-youtube" class="hidden">
+          <p class="muted small">YouTube Music n'a pas d'API officielle de gestion des playlists :
+          l'application utilise <code>ytmusicapi</code> avec une autorisation Google OAuth.
+          Cette intégration non officielle peut cesser de fonctionner si Google modifie son service.
+          Les morceaux sont retrouvés par titre, artiste et durée.</p>
+
+          <div id="youtube-setup" class="provider-box hidden">
+            <p class="muted small">Dans la
+            <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener">Google Cloud Console</a>,
+            créez un client OAuth de type <strong>« TV et appareils à accès limité »</strong> et activez l'API YouTube Data.</p>
+            <details id="youtube-setup-details" class="setup-details">
+              <summary>Configuration YouTube Music</summary>
+              <form id="youtube-config-form" class="apple-form">
+                <label>Client ID Google
+                  <input id="youtube-client-id" type="text" placeholder="…apps.googleusercontent.com" autocomplete="off" spellcheck="false">
+                </label>
+                <label>Client Secret Google
+                  <input id="youtube-client-secret" type="password" placeholder="Votre Client Secret" autocomplete="off">
+                </label>
+                <button class="btn" type="submit">Enregistrer la configuration</button>
+                <p class="muted small">Le Client Secret est stocké localement dans <code>data/config.json</code>.</p>
+              </form>
+            </details>
+          </div>
+
+          <div id="youtube-connect" class="provider-box hidden">
+            <p class="muted small">Configuration enregistrée. Connectez votre compte Google pour autoriser YouTube Music.</p>
+            <div class="row">
+              <button id="youtube-connect-btn" class="btn" type="button">Connecter YouTube Music</button>
+              <button id="youtube-reconfigure-btn" class="btn ghost" type="button">Reconfigurer</button>
+            </div>
+            <div id="youtube-device" class="device-code hidden">
+              <p class="muted small">Ouvrez <a id="youtube-verification-link" href="#" target="_blank" rel="noopener">la page Google</a>
+              et saisissez ce code :</p>
+              <div id="youtube-user-code" class="device-code-value"></div>
+              <p id="youtube-device-status" class="muted small">En attente de l'autorisation…</p>
+            </div>
+          </div>
+
+          <div id="youtube-connected" class="provider-box hidden">
+            <p class="muted small">Connecté à YouTube Music.</p>
+            <div class="row">
+              <button id="youtube-disconnect-btn" class="btn ghost small" type="button">Déconnecter YouTube Music</button>
+              <button id="youtube-reconfigure-btn-2" class="btn ghost small" type="button">Reconfigurer</button>
+            </div>
+          </div>
+
+          <div id="youtube-target" class="hidden">
+            <label class="radio-line"><input type="radio" name="youtube-target-mode" value="new" checked> Créer une nouvelle playlist</label>
+            <div id="youtube-new-fields" class="field-group">
+              <input id="youtube-new-name" type="text" placeholder="Nom de la playlist" value="Ma playlist YouTube Music">
+              <input id="youtube-new-desc" type="text" placeholder="Description (optionnel)">
+              <label class="check-line"><input type="checkbox" id="youtube-new-public"> Playlist publique</label>
+            </div>
+            <label class="radio-line"><input type="radio" name="youtube-target-mode" value="existing"> Utiliser une playlist YouTube Music existante</label>
+            <div id="youtube-existing-fields" class="field-group hidden">
+              <select id="youtube-target-select"></select>
+              <p class="muted small">Vos playlists YouTube Music modifiables.</p>
+            </div>
+            <p class="muted small">Les morceaux introuvables sont ignorés et listés dans le résultat.</p>
+          </div>
+        </div>
+
         <h2>3 · Doublons</h2>
         <label class="check-line"><input type="checkbox" id="opt-dedupe" checked> Retirer les doublons</label>
         <label class="check-line indent"><input type="checkbox" id="opt-isrc"> Détecter aussi les mêmes morceaux (même ISRC, versions différentes)</label>
@@ -199,11 +329,11 @@
         <ul id="dup-list"></ul>
       </details>
       <details id="unmatched-details" class="hidden">
-        <summary>Voir les morceaux introuvables sur Apple Music</summary>
+        <summary id="unmatched-summary">Voir les morceaux introuvables</summary>
         <ul id="unmatched-list"></ul>
       </details>
       <p id="skipped-wrap" class="muted small hidden"></p>
-      <button id="new-merge-btn" class="btn ghost">Nouvelle fusion</button>
+      <button id="new-merge-btn" class="btn ghost">Nouvelle opération</button>
     </div>
   </section>
 </main>

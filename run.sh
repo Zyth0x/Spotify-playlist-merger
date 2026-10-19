@@ -2,6 +2,12 @@
 set -e
 cd "$(dirname "$0")"
 
+python3 - <<'PY'
+import sys
+if sys.version_info < (3, 9):
+    sys.exit("Python 3.9 ou supérieur est requis.")
+PY
+
 if [ ! -d .venv ]; then
   echo "Création de l'environnement virtuel…"
   python3 -m venv .venv

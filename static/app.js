@@ -14,7 +14,28 @@ const state = {
     playlistsLoaded: false,
     playlistsLoading: false,
   },
+  deezer: {
+    configured: false,
+    authenticated: false,
+    app_id: null,
+    redirect_uri: "http://127.0.0.1:8888/deezer/callback",
+    playlists: [],
+    playlistsLoaded: false,
+    playlistsLoading: false,
+  },
+  youtube: {
+    configured: false,
+    authenticated: false,
+    client_id: null,
+    playlists: [],
+    playlistsLoaded: false,
+    playlistsLoading: false,
+    deviceFlowId: null,
+    deviceTimer: null,
+  },
   showAppleSetup: false,
+  showDeezerSetup: false,
+  showYouTubeSetup: false,
   appleMusic: {
     scriptPromise: null,
     ready: null,
@@ -72,6 +93,17 @@ async function boot() {
   const params = new URLSearchParams(window.location.search);
   if (params.get("connected")) banner("Connexion à Spotify réussie.", "ok");
   if (params.get("auth_error")) banner("La connexion à Spotify a échoué. Réessayez.", "error");
+  if (params.get("deezer_connected")) banner("Connexion à Deezer réussie.", "ok");
+  const deezerError = params.get("deezer_error");
+  if (deezerError === "config") banner("Configurez d'abord votre application Deezer.", "error");
+  else if (deezerError) banner("La connexion à Deezer a échoué. Réessayez.", "error");
+  const providerParam = params.get("provider");
+  if (providerParam) {
+    const radio = document.querySelector(
+      `input[name="target-provider"][value="${providerParam}"]`
+    );
+    if (radio) radio.checked = true;
+  }
   if (params.toString()) window.history.replaceState(null, "", "/");
 
   try {
@@ -86,12 +118,19 @@ async function boot() {
     }
     state.me = data.me;
     if (data.apple) Object.assign(state.apple, data.apple);
+    if (data.deezer) Object.assign(state.deezer, data.deezer);
+    if (data.youtube_music) Object.assign(state.youtube, data.youtube_music);
     renderUser(data.me);
     showView("merger");
     renderTargetOptions();
     renderAppleSection();
+    renderDeezerSection();
+    renderYouTubeSection();
+    syncProviderFields();
     syncTargetFields("spotify");
     syncTargetFields("apple");
+    syncTargetFields("deezer");
+    syncTargetFields("youtube");
     loadPlaylists();
   } catch (err) {
     banner(err.message, "error");
@@ -244,6 +283,8 @@ function syncProviderFields() {
   const provider = currentProvider();
   el("provider-spotify").classList.toggle("hidden", provider !== "spotify");
   el("provider-apple").classList.toggle("hidden", provider !== "apple_music");
+  el("provider-deezer").classList.toggle("hidden", provider !== "deezer");
+  el("provider-youtube").classList.toggle("hidden", provider !== "youtube_music");
   if (provider === "apple_music") {
     renderAppleSection();
     if (state.apple.configured) {
@@ -251,6 +292,10 @@ function syncProviderFields() {
         /* l'erreur sera affichée au moment de la connexion */
       });
     }
+  } else if (provider === "deezer") {
+    renderDeezerSection();
+  } else if (provider === "youtube_music") {
+    renderYouTubeSection();
   }
 }
 
@@ -259,9 +304,15 @@ function syncTargetFields(prefix) {
   if (prefix === "spotify") {
     el("new-fields").classList.toggle("hidden", mode !== "new");
     el("existing-fields").classList.toggle("hidden", mode !== "existing");
-  } else {
+  } else if (prefix === "apple") {
     el("apple-new-fields").classList.toggle("hidden", mode !== "new");
     el("apple-existing-fields").classList.toggle("hidden", mode !== "existing");
+  } else if (prefix === "deezer") {
+    el("deezer-new-fields").classList.toggle("hidden", mode !== "new");
+    el("deezer-existing-fields").classList.toggle("hidden", mode !== "existing");
+  } else {
+    el("youtube-new-fields").classList.toggle("hidden", mode !== "new");
+    el("youtube-existing-fields").classList.toggle("hidden", mode !== "existing");
   }
 }
 
@@ -474,6 +525,287 @@ function renderAppleTargetOptions() {
   }
 }
 
+// ----------------------------------------------------------------- Deezer
+
+function renderDeezerSection() {
+  const deezer = state.deezer;
+  const setupVisible = !deezer.configured || state.showDeezerSetup;
+  el("deezer-setup").classList.toggle("hidden", !setupVisible);
+  el("deezer-setup-details").open = setupVisible;
+  el("deezer-connect").classList.toggle("hidden", !deezer.configured || deezer.authenticated);
+  el("deezer-connected").classList.toggle("hidden", !deezer.authenticated);
+  el("deezer-target").classList.toggle("hidden", !deezer.authenticated);
+
+  if (deezer.app_id) el("deezer-app-id").value = deezer.app_id;
+  if (deezer.redirect_uri) el("deezer-redirect-uri").textContent = deezer.redirect_uri;
+
+  if (
+    deezer.authenticated &&
+    currentProvider() === "deezer" &&
+    !deezer.playlistsLoaded &&
+    !deezer.playlistsLoading
+  ) {
+    loadDeezerPlaylists();
+  }
+}
+
+async function saveDeezerConfig(event) {
+  event.preventDefault();
+  const appId = el("deezer-app-id").value.trim();
+  const appSecret = el("deezer-app-secret").value.trim();
+  if (!appId || !appSecret) {
+    banner("Renseignez l'App ID et l'App Secret Deezer.", "error");
+    return;
+  }
+  try {
+    const data = await api("/api/deezer/config", {
+      method: "POST",
+      body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+    });
+    Object.assign(state.deezer, data.deezer, { playlists: [], playlistsLoaded: false });
+    state.showDeezerSetup = false;
+    el("deezer-app-secret").value = "";
+    renderDeezerSection();
+    banner("Configuration Deezer enregistrée. Connectez votre compte.", "ok");
+  } catch (err) {
+    banner(err.message, "error");
+  }
+}
+
+function openDeezerSetup() {
+  state.showDeezerSetup = true;
+  renderDeezerSection();
+}
+
+async function disconnectDeezer() {
+  try {
+    await api("/api/deezer/logout", { method: "POST" });
+    state.deezer.authenticated = false;
+    state.deezer.playlists = [];
+    state.deezer.playlistsLoaded = false;
+    renderDeezerSection();
+    banner("Compte Deezer déconnecté.", "");
+  } catch (err) {
+    banner(err.message, "error");
+  }
+}
+
+async function loadDeezerPlaylists() {
+  if (!state.deezer.authenticated || state.deezer.playlistsLoading) return;
+  state.deezer.playlistsLoading = true;
+  const select = el("deezer-target-select");
+  select.innerHTML = '<option value="">Chargement…</option>';
+  try {
+    const data = await api("/api/deezer/playlists");
+    state.deezer.playlists = data.playlists || [];
+    state.deezer.playlistsLoaded = true;
+    renderDeezerTargetOptions();
+  } catch (err) {
+    select.innerHTML = '<option value="">Erreur de chargement</option>';
+    banner(err.message, "error");
+    if (/session|reconnect|non connecté/i.test(err.message)) {
+      state.deezer.authenticated = false;
+      state.deezer.playlistsLoaded = false;
+      renderDeezerSection();
+    }
+  } finally {
+    state.deezer.playlistsLoading = false;
+  }
+}
+
+function renderDeezerTargetOptions() {
+  const select = el("deezer-target-select");
+  const options = (state.deezer.playlists || []).filter((p) => p.can_edit !== false);
+  select.innerHTML = "";
+  if (!options.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "Aucune playlist Deezer modifiable";
+    select.appendChild(option);
+    return;
+  }
+  for (const playlist of options) {
+    const option = document.createElement("option");
+    option.value = playlist.id;
+    option.textContent = playlist.name;
+    select.appendChild(option);
+  }
+}
+
+// ---------------------------------------------------------- YouTube Music
+
+function renderYouTubeSection() {
+  const youtube = state.youtube;
+  const setupVisible = !youtube.configured || state.showYouTubeSetup;
+  el("youtube-setup").classList.toggle("hidden", !setupVisible);
+  el("youtube-setup-details").open = setupVisible;
+  el("youtube-connect").classList.toggle("hidden", !youtube.configured || youtube.authenticated);
+  el("youtube-connected").classList.toggle("hidden", !youtube.authenticated);
+  el("youtube-target").classList.toggle("hidden", !youtube.authenticated);
+
+  if (youtube.client_id) el("youtube-client-id").value = youtube.client_id;
+
+  if (
+    youtube.authenticated &&
+    currentProvider() === "youtube_music" &&
+    !youtube.playlistsLoaded &&
+    !youtube.playlistsLoading
+  ) {
+    loadYouTubePlaylists();
+  }
+}
+
+async function saveYouTubeConfig(event) {
+  event.preventDefault();
+  stopYouTubePolling();
+  el("youtube-device").classList.add("hidden");
+  const clientId = el("youtube-client-id").value.trim();
+  const clientSecret = el("youtube-client-secret").value.trim();
+  if (!clientId || !clientSecret) {
+    banner("Renseignez le Client ID et le Client Secret Google.", "error");
+    return;
+  }
+  try {
+    const data = await api("/api/youtube/config", {
+      method: "POST",
+      body: JSON.stringify({ client_id: clientId, client_secret: clientSecret }),
+    });
+    Object.assign(state.youtube, data.youtube_music, {
+      playlists: [],
+      playlistsLoaded: false,
+    });
+    state.showYouTubeSetup = false;
+    el("youtube-client-secret").value = "";
+    renderYouTubeSection();
+    banner("Configuration YouTube Music enregistrée. Connectez votre compte.", "ok");
+  } catch (err) {
+    banner(err.message, "error");
+  }
+}
+
+function openYouTubeSetup() {
+  stopYouTubePolling();
+  el("youtube-device").classList.add("hidden");
+  state.showYouTubeSetup = true;
+  renderYouTubeSection();
+}
+
+function stopYouTubePolling() {
+  if (state.youtube.deviceTimer) {
+    clearTimeout(state.youtube.deviceTimer);
+    state.youtube.deviceTimer = null;
+  }
+}
+
+async function connectYouTubeMusic() {
+  const button = el("youtube-connect-btn");
+  button.disabled = true;
+  stopYouTubePolling();
+  try {
+    const data = await api("/api/youtube/device", { method: "POST" });
+    const verificationUrl = data.verification_url || "https://www.google.com/device";
+    state.youtube.deviceFlowId = data.flow_id;
+    el("youtube-verification-link").href = verificationUrl;
+    el("youtube-user-code").textContent = data.user_code || "";
+    el("youtube-device-status").textContent = "En attente de l'autorisation…";
+    el("youtube-device").classList.remove("hidden");
+    window.open(verificationUrl, "_blank", "noopener");
+
+    const interval = Math.max(2, Number(data.interval) || 5) * 1000;
+    const poll = async () => {
+      try {
+        const status = await api(
+          `/api/youtube/device/status?flow_id=${encodeURIComponent(state.youtube.deviceFlowId)}`
+        );
+        if (status.status === "pending") {
+          el("youtube-device-status").textContent = "En attente de l'autorisation…";
+          state.youtube.deviceTimer = setTimeout(poll, interval);
+        } else if (status.status === "done") {
+          Object.assign(state.youtube, status.youtube_music, {
+            playlists: [],
+            playlistsLoaded: false,
+            deviceFlowId: null,
+          });
+          state.youtube.deviceTimer = null;
+          el("youtube-device").classList.add("hidden");
+          renderYouTubeSection();
+          banner("Connexion à YouTube Music réussie.", "ok");
+        } else {
+          state.youtube.deviceTimer = null;
+          el("youtube-device-status").textContent =
+            status.error || "Autorisation YouTube Music échouée.";
+        }
+      } catch (err) {
+        state.youtube.deviceTimer = null;
+        el("youtube-device-status").textContent = err.message;
+      }
+    };
+    state.youtube.deviceTimer = setTimeout(poll, interval);
+  } catch (err) {
+    banner(err.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function disconnectYouTubeMusic() {
+  stopYouTubePolling();
+  try {
+    await api("/api/youtube/logout", { method: "POST" });
+    state.youtube.authenticated = false;
+    state.youtube.playlists = [];
+    state.youtube.playlistsLoaded = false;
+    state.youtube.deviceFlowId = null;
+    el("youtube-device").classList.add("hidden");
+    renderYouTubeSection();
+    banner("Compte YouTube Music déconnecté.", "");
+  } catch (err) {
+    banner(err.message, "error");
+  }
+}
+
+async function loadYouTubePlaylists() {
+  if (!state.youtube.authenticated || state.youtube.playlistsLoading) return;
+  state.youtube.playlistsLoading = true;
+  const select = el("youtube-target-select");
+  select.innerHTML = '<option value="">Chargement…</option>';
+  try {
+    const data = await api("/api/youtube/playlists");
+    state.youtube.playlists = data.playlists || [];
+    state.youtube.playlistsLoaded = true;
+    renderYouTubeTargetOptions();
+  } catch (err) {
+    select.innerHTML = '<option value="">Erreur de chargement</option>';
+    banner(err.message, "error");
+    if (/session|reconnect|non connecté/i.test(err.message)) {
+      state.youtube.authenticated = false;
+      state.youtube.playlistsLoaded = false;
+      renderYouTubeSection();
+    }
+  } finally {
+    state.youtube.playlistsLoading = false;
+  }
+}
+
+function renderYouTubeTargetOptions() {
+  const select = el("youtube-target-select");
+  const options = (state.youtube.playlists || []).filter((p) => p.can_edit !== false);
+  select.innerHTML = "";
+  if (!options.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "Aucune playlist YouTube Music modifiable";
+    select.appendChild(option);
+    return;
+  }
+  for (const playlist of options) {
+    const option = document.createElement("option");
+    option.value = playlist.id;
+    option.textContent = playlist.name;
+    select.appendChild(option);
+  }
+}
+
 // ------------------------------------------------------------------- merge
 
 async function startMerge() {
@@ -488,7 +820,30 @@ async function startMerge() {
 
   const provider = currentProvider();
   let target;
-  if (provider === "apple_music") {
+  if (provider === "spotify") {
+    const mode = currentTargetMode("spotify");
+    if (mode === "new") {
+      target = {
+        provider,
+        mode,
+        name: el("new-name").value.trim(),
+        description: el("new-desc").value.trim(),
+        public: el("new-public").checked,
+      };
+      if (!target.name) {
+        errorNode.textContent = "Indiquez un nom pour la nouvelle playlist.";
+        errorNode.classList.remove("hidden");
+        return;
+      }
+    } else {
+      target = { provider, mode, id: el("target-select").value };
+      if (!target.id) {
+        errorNode.textContent = "Choisissez une playlist existante.";
+        errorNode.classList.remove("hidden");
+        return;
+      }
+    }
+  } else if (provider === "apple_music") {
     if (!state.apple.configured) {
       errorNode.textContent = "Configurez d'abord Apple Music.";
       errorNode.classList.remove("hidden");
@@ -523,28 +878,74 @@ async function startMerge() {
       const playlist = (state.apple.playlists || []).find((p) => p.id === id);
       target = { provider, mode, id, name: playlist ? playlist.name : "" };
     }
-  } else {
-    const mode = currentTargetMode("spotify");
+  } else if (provider === "deezer") {
+    if (!state.deezer.configured) {
+      errorNode.textContent = "Configurez d'abord Deezer.";
+      errorNode.classList.remove("hidden");
+      return;
+    }
+    if (!state.deezer.authenticated) {
+      errorNode.textContent = "Connectez votre compte Deezer avant de lancer le transfert.";
+      errorNode.classList.remove("hidden");
+      return;
+    }
+    const mode = currentTargetMode("deezer");
     if (mode === "new") {
       target = {
         provider,
         mode,
-        name: el("new-name").value.trim(),
-        description: el("new-desc").value.trim(),
-        public: el("new-public").checked,
+        name: el("deezer-new-name").value.trim(),
+        description: el("deezer-new-desc").value.trim(),
       };
       if (!target.name) {
-        errorNode.textContent = "Indiquez un nom pour la nouvelle playlist.";
+        errorNode.textContent = "Indiquez un nom pour la nouvelle playlist Deezer.";
         errorNode.classList.remove("hidden");
         return;
       }
     } else {
-      target = { provider, mode, id: el("target-select").value };
-      if (!target.id) {
-        errorNode.textContent = "Choisissez une playlist existante.";
+      const id = el("deezer-target-select").value;
+      if (!id) {
+        errorNode.textContent = "Choisissez une playlist Deezer existante.";
         errorNode.classList.remove("hidden");
         return;
       }
+      const playlist = (state.deezer.playlists || []).find((p) => p.id === id);
+      target = { provider, mode, id, name: playlist ? playlist.name : "" };
+    }
+  } else {
+    if (!state.youtube.configured) {
+      errorNode.textContent = "Configurez d'abord YouTube Music.";
+      errorNode.classList.remove("hidden");
+      return;
+    }
+    if (!state.youtube.authenticated) {
+      errorNode.textContent = "Connectez votre compte YouTube Music avant de lancer le transfert.";
+      errorNode.classList.remove("hidden");
+      return;
+    }
+    const mode = currentTargetMode("youtube");
+    if (mode === "new") {
+      target = {
+        provider,
+        mode,
+        name: el("youtube-new-name").value.trim(),
+        description: el("youtube-new-desc").value.trim(),
+        public: el("youtube-new-public").checked,
+      };
+      if (!target.name) {
+        errorNode.textContent = "Indiquez un nom pour la nouvelle playlist YouTube Music.";
+        errorNode.classList.remove("hidden");
+        return;
+      }
+    } else {
+      const id = el("youtube-target-select").value;
+      if (!id) {
+        errorNode.textContent = "Choisissez une playlist YouTube Music existante.";
+        errorNode.classList.remove("hidden");
+        return;
+      }
+      const playlist = (state.youtube.playlists || []).find((p) => p.id === id);
+      target = { provider, mode, id, name: playlist ? playlist.name : "" };
     }
   }
 
@@ -556,7 +957,7 @@ async function startMerge() {
 
   el("start-btn").disabled = true;
   el("result-card").classList.add("hidden");
-  el("progress-title").textContent = provider === "apple_music" ? "Transfert en cours…" : "Fusion en cours…";
+  el("progress-title").textContent = provider !== "spotify" ? "Transfert en cours…" : "Fusion en cours…";
   try {
     const data = await api("/api/merge", {
       method: "POST",
@@ -623,17 +1024,18 @@ function renderResult(job) {
   const result = job.result || {};
   const stats = result.stats || {};
   const cancelled = job.status === "cancelled";
-  const isApple = result.provider === "apple_music";
+  const isExternal = result.provider !== "spotify";
+  const providerLabel = result.provider_label || (isExternal ? "le fournisseur" : "Spotify");
 
   el("result-title").textContent = result.dry_run
     ? "Simulation terminée"
-    : isApple
+    : isExternal
       ? "Transfert terminé"
       : "Fusion terminée";
 
   let sub = "";
   if (cancelled) sub = "Opération annulée. ";
-  const destination = isApple ? " sur Apple Music" : "";
+  const destination = isExternal ? " sur " + providerLabel : "";
   if (result.dry_run) {
     sub += `${result.to_add} morceau(x) unique(s) seraient ajoutés à « ${result.playlist_name} »${destination}. Aucune modification n'a été effectuée.`;
   } else if (result.added != null) {
@@ -641,11 +1043,13 @@ function renderResult(job) {
   }
   el("result-sub").textContent = sub;
 
-  const rows = [[isApple ? "Morceaux à ajouter" : "Morceaux uniques retenus", result.to_add]];
-  if (isApple) {
-    rows.push(["Correspondances exactes (ISRC)", stats.matched_isrc]);
+  const rows = [[isExternal ? "Morceaux à ajouter" : "Morceaux uniques retenus", result.to_add]];
+  if (isExternal) {
+    if (result.provider !== "youtube_music") {
+      rows.push(["Correspondances exactes (ISRC)", stats.matched_isrc]);
+    }
     rows.push(["Correspondances par recherche", stats.matched_search]);
-    rows.push(["Introuvables sur Apple Music", stats.unmatched]);
+    rows.push(["Introuvables sur " + providerLabel, stats.unmatched]);
     rows.push(["Doublons ignorés (entre sources)", stats.duplicates]);
   } else {
     rows.push(["Doublons ignorés (entre playlists)", stats.duplicates]);
@@ -666,8 +1070,8 @@ function renderResult(job) {
   const linkWrap = el("result-link-wrap");
   if (result.playlist_url && !result.dry_run) {
     el("result-link").href = result.playlist_url;
-    el("result-link").textContent = isApple
-      ? "Ouvrir la playlist dans Apple Music"
+    el("result-link").textContent = isExternal
+      ? "Ouvrir la playlist dans " + providerLabel
       : "Ouvrir la playlist dans Spotify";
     linkWrap.classList.remove("hidden");
   } else {
@@ -686,6 +1090,8 @@ function renderResult(job) {
   const unmatchedDetails = el("unmatched-details");
   const unmatchedPreview = result.unmatched_preview || [];
   if (unmatchedPreview.length) {
+    el("unmatched-summary").textContent =
+      "Voir les morceaux introuvables sur " + providerLabel;
     el("unmatched-list").innerHTML = unmatchedPreview
       .map((label) => `<li>${escapeHtml(label)}</li>`)
       .join("");
@@ -774,6 +1180,14 @@ document.querySelectorAll('input[name="apple-target-mode"]').forEach((radio) => 
   radio.addEventListener("change", () => syncTargetFields("apple"));
 });
 
+document.querySelectorAll('input[name="deezer-target-mode"]').forEach((radio) => {
+  radio.addEventListener("change", () => syncTargetFields("deezer"));
+});
+
+document.querySelectorAll('input[name="youtube-target-mode"]').forEach((radio) => {
+  radio.addEventListener("change", () => syncTargetFields("youtube"));
+});
+
 el("apple-config-form").addEventListener("submit", saveAppleConfig);
 el("apple-key-file").addEventListener("change", async (event) => {
   const file = event.target.files && event.target.files[0];
@@ -789,11 +1203,26 @@ el("apple-disconnect-btn").addEventListener("click", disconnectAppleMusic);
 el("apple-reconfigure-btn").addEventListener("click", openAppleSetup);
 el("apple-reconfigure-btn-2").addEventListener("click", openAppleSetup);
 
+el("deezer-config-form").addEventListener("submit", saveDeezerConfig);
+el("deezer-disconnect-btn").addEventListener("click", disconnectDeezer);
+el("deezer-reconfigure-btn").addEventListener("click", openDeezerSetup);
+el("deezer-reconfigure-btn-2").addEventListener("click", openDeezerSetup);
+
+el("youtube-config-form").addEventListener("submit", saveYouTubeConfig);
+el("youtube-connect-btn").addEventListener("click", connectYouTubeMusic);
+el("youtube-disconnect-btn").addEventListener("click", disconnectYouTubeMusic);
+el("youtube-reconfigure-btn").addEventListener("click", openYouTubeSetup);
+el("youtube-reconfigure-btn-2").addEventListener("click", openYouTubeSetup);
+
 el("start-btn").addEventListener("click", startMerge);
 el("cancel-btn").addEventListener("click", cancelJob);
 el("new-merge-btn").addEventListener("click", resetMerge);
 
 syncTargetFields("spotify");
 syncTargetFields("apple");
+syncTargetFields("deezer");
+syncTargetFields("youtube");
 renderAppleSection();
+renderDeezerSection();
+renderYouTubeSection();
 boot();

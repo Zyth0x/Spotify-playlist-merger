@@ -119,7 +119,7 @@ code {
 .row { display: flex; gap: 10px; margin-top: 14px; }
 .row input { flex: 1; }
 
-input[type="text"], select {
+input[type="text"], input[type="password"], select {
   width: 100%;
   background: var(--panel-2);
   border: 1px solid var(--border);
@@ -130,7 +130,7 @@ input[type="text"], select {
   outline: none;
 }
 
-input[type="text"]:focus, select:focus { border-color: var(--accent); }
+input[type="text"]:focus, input[type="password"]:focus, select:focus { border-color: var(--accent); }
 
 .check-line, .radio-line {
   display: flex;
@@ -198,6 +198,24 @@ input[type="text"]:focus, select:focus { border-color: var(--accent); }
 
 .setup-details { margin-top: 10px; }
 .setup-details summary { cursor: pointer; font-size: 14px; font-weight: 600; }
+
+.device-code {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.device-code-value {
+  display: inline-block;
+  margin: 8px 0;
+  padding: 10px 16px;
+  border: 1px dashed var(--accent);
+  border-radius: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 2px;
+}
 
 .apple-form {
   display: flex;
