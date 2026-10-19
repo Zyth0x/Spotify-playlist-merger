@@ -1,9 +1,17 @@
 const state = {
+  sourceProvider: "spotify",
   playlists: [],
   selected: new Set(),
   jobId: null,
   jobTimer: null,
   me: null,
+  spotify: {
+    configured: false,
+    authenticated: false,
+  },
+  spotifyDestinationPlaylists: [],
+  spotifyDestinationLoaded: false,
+  spotifyDestinationLoading: false,
   apple: {
     configured: false,
     authenticated: false,
@@ -44,6 +52,13 @@ const state = {
 };
 
 const el = (id) => document.getElementById(id);
+
+const providerLabels = {
+  spotify: "Spotify",
+  apple_music: "Apple Music",
+  deezer: "Deezer",
+  youtube_music: "YouTube Music",
+};
 
 const views = {
   setup: el("view-setup"),
@@ -97,7 +112,12 @@ async function boot() {
   const deezerError = params.get("deezer_error");
   if (deezerError === "config") banner("Configurez d'abord votre application Deezer.", "error");
   else if (deezerError) banner("La connexion à Deezer a échoué. Réessayez.", "error");
-  const providerParam = params.get("provider");
+  const storedSource = window.sessionStorage.getItem("sourceProvider");
+  if (storedSource && providerLabels[storedSource]) {
+    state.sourceProvider = storedSource;
+  }
+  const providerParam =
+    params.get("provider") || window.sessionStorage.getItem("targetProvider");
   if (providerParam) {
     const radio = document.querySelector(
       `input[name="target-provider"][value="${providerParam}"]`
@@ -108,21 +128,18 @@ async function boot() {
 
   try {
     const data = await api("/api/state");
-    if (!data.has_client_id) {
-      showView("setup");
-      return;
-    }
-    if (!data.authenticated) {
-      showView("login");
-      return;
-    }
     state.me = data.me;
+    state.spotify = (data.providers && data.providers.spotify) || {
+      configured: Boolean(data.has_client_id),
+      authenticated: Boolean(data.authenticated),
+    };
     if (data.apple) Object.assign(state.apple, data.apple);
     if (data.deezer) Object.assign(state.deezer, data.deezer);
     if (data.youtube_music) Object.assign(state.youtube, data.youtube_music);
     renderUser(data.me);
     showView("merger");
-    renderTargetOptions();
+    renderSpotifyConnection();
+    el("source-provider-select").value = state.sourceProvider;
     renderAppleSection();
     renderDeezerSection();
     renderYouTubeSection();
@@ -131,7 +148,9 @@ async function boot() {
     syncTargetFields("apple");
     syncTargetFields("deezer");
     syncTargetFields("youtube");
-    loadPlaylists();
+    renderSourceStatus();
+    loadSpotifyDestinationPlaylists();
+    loadSourcePlaylists();
   } catch (err) {
     banner(err.message, "error");
     showView("setup");
@@ -168,17 +187,100 @@ async function saveClientId(inputId) {
   }
 }
 
-async function loadPlaylists() {
+function currentSourceProvider() {
+  return el("source-provider-select").value;
+}
+
+function providerState(provider) {
+  if (provider === "spotify") return state.spotify;
+  if (provider === "apple_music") return state.apple;
+  if (provider === "deezer") return state.deezer;
+  return state.youtube;
+}
+
+function providerReady(provider) {
+  const providerInfo = providerState(provider);
+  return Boolean(providerInfo.configured && providerInfo.authenticated);
+}
+
+function sourceStatusMessage(provider) {
+  const providerInfo = providerState(provider);
+  const label = providerLabels[provider] || provider;
+  if (!providerInfo.configured) {
+    return `${label} n'est pas configuré. Utilisez la section Connexions aux fournisseurs.`;
+  }
+  if (!providerInfo.authenticated) {
+    return `${label} n'est pas connecté. Utilisez la section Connexions aux fournisseurs.`;
+  }
+  return `Source : ${label}.`;
+}
+
+function renderSpotifyConnection() {
+  const configured = state.spotify.configured;
+  const authenticated = state.spotify.authenticated;
+  el("spotify-not-configured").classList.toggle("hidden", configured);
+  el("spotify-not-connected").classList.toggle("hidden", !configured || authenticated);
+  el("spotify-connected").classList.toggle("hidden", !authenticated);
+  if (authenticated && state.me) {
+    el("spotify-user-name").textContent = state.me.display_name || "";
+  }
+}
+
+function renderSourceStatus() {
+  el("source-status").textContent = sourceStatusMessage(currentSourceProvider());
+}
+
+function refreshSourceIfNeeded(provider) {
+  renderSourceStatus();
+  if (currentSourceProvider() === provider) {
+    loadSourcePlaylists();
+  }
+}
+
+async function loadSourcePlaylists() {
+  const provider = currentSourceProvider();
   const list = el("playlist-list");
+  state.playlists = [];
+  state.selected.clear();
+  renderPlaylists();
+  renderSourceStatus();
+  if (!providerReady(provider)) {
+    list.innerHTML = `<li class="loading">${escapeHtml(sourceStatusMessage(provider))}</li>`;
+    return;
+  }
   list.innerHTML = '<li class="loading">Chargement de vos playlists…</li>';
   try {
-    const data = await api("/api/playlists");
+    const data = await api(`/api/playlists?provider=${encodeURIComponent(provider)}`);
     state.playlists = data.playlists || [];
     renderPlaylists();
-    renderTargetOptions();
   } catch (err) {
     list.innerHTML = `<li class="loading">${escapeHtml(err.message)}</li>`;
-    if (err.message.toLowerCase().includes("reconnect")) showView("login");
+    if (provider === "spotify" && /reconnect|session|non connecté/i.test(err.message)) {
+      showView("login");
+    }
+  }
+}
+
+async function loadSpotifyDestinationPlaylists() {
+  if (
+    !state.spotify.authenticated ||
+    state.spotifyDestinationLoading ||
+    state.spotifyDestinationLoaded
+  ) {
+    return;
+  }
+  state.spotifyDestinationLoading = true;
+  try {
+    const data = await api("/api/playlists?provider=spotify");
+    state.spotifyDestinationPlaylists = data.playlists || [];
+    state.spotifyDestinationLoaded = true;
+    renderTargetOptions();
+  } catch (err) {
+    state.spotifyDestinationPlaylists = [];
+    renderTargetOptions();
+    banner(err.message, "error");
+  } finally {
+    state.spotifyDestinationLoading = false;
   }
 }
 
@@ -232,7 +334,9 @@ function renderPlaylists() {
     const sub = document.createElement("div");
     sub.className = "sub";
     const ownerLabel = playlist.owned ? "vous" : playlist.owner;
-    sub.textContent = `${countLabel(playlist)} · ${ownerLabel}`;
+    sub.textContent = ownerLabel
+      ? `${countLabel(playlist)} · ${ownerLabel}`
+      : countLabel(playlist);
     meta.appendChild(name);
     meta.appendChild(sub);
     label.prepend(checkbox);
@@ -254,7 +358,13 @@ function updateSelectionCount() {
 
 function renderTargetOptions() {
   const select = el("target-select");
-  const options = state.playlists.filter((p) => p.can_read);
+  if (!state.spotifyDestinationLoaded && state.spotifyDestinationLoading) {
+    select.innerHTML = '<option value="">Chargement des playlists Spotify…</option>';
+    return;
+  }
+  const options = (state.spotifyDestinationPlaylists || []).filter(
+    (p) => p.can_edit !== false
+  );
   select.innerHTML = "";
   if (!options.length) {
     const option = document.createElement("option");
@@ -285,7 +395,10 @@ function syncProviderFields() {
   el("provider-apple").classList.toggle("hidden", provider !== "apple_music");
   el("provider-deezer").classList.toggle("hidden", provider !== "deezer");
   el("provider-youtube").classList.toggle("hidden", provider !== "youtube_music");
-  if (provider === "apple_music") {
+  if (provider === "spotify") {
+    loadSpotifyDestinationPlaylists();
+    renderTargetOptions();
+  } else if (provider === "apple_music") {
     renderAppleSection();
     if (state.apple.configured) {
       prepareAppleMusic().catch(() => {
@@ -362,7 +475,7 @@ function renderAppleSection() {
   const apple = state.apple;
   const setupVisible = !apple.configured || state.showAppleSetup;
   el("apple-setup").classList.toggle("hidden", !setupVisible);
-  el("apple-setup-details").open = setupVisible;
+  el("apple-setup-details").open = state.showAppleSetup;
   el("apple-connect").classList.toggle("hidden", !apple.configured || apple.authenticated);
   el("apple-connected").classList.toggle("hidden", !apple.authenticated);
   el("apple-target").classList.toggle("hidden", !apple.authenticated);
@@ -411,6 +524,7 @@ async function saveAppleConfig(event) {
     el("apple-key-input").value = "";
     el("apple-key-file").value = "";
     renderAppleSection();
+    refreshSourceIfNeeded("apple_music");
     banner("Configuration Apple Music enregistrée.", "ok");
 
     if (state.appleMusic.instance) {
@@ -447,6 +561,7 @@ async function connectAppleMusic() {
     Object.assign(state.apple, data.apple, { playlists: [], playlistsLoaded: false });
     state.showAppleSetup = false;
     renderAppleSection();
+    refreshSourceIfNeeded("apple_music");
     banner("Connexion à Apple Music réussie.", "ok");
   } catch (err) {
     const message = err && err.message ? err.message : "Connexion à Apple Music impossible.";
@@ -477,6 +592,7 @@ async function disconnectAppleMusic() {
     state.apple.playlists = [];
     state.apple.playlistsLoaded = false;
     renderAppleSection();
+    refreshSourceIfNeeded("apple_music");
     banner("Compte Apple Music déconnecté.", "");
   } catch (err) {
     banner(err.message, "error");
@@ -531,7 +647,7 @@ function renderDeezerSection() {
   const deezer = state.deezer;
   const setupVisible = !deezer.configured || state.showDeezerSetup;
   el("deezer-setup").classList.toggle("hidden", !setupVisible);
-  el("deezer-setup-details").open = setupVisible;
+  el("deezer-setup-details").open = state.showDeezerSetup;
   el("deezer-connect").classList.toggle("hidden", !deezer.configured || deezer.authenticated);
   el("deezer-connected").classList.toggle("hidden", !deezer.authenticated);
   el("deezer-target").classList.toggle("hidden", !deezer.authenticated);
@@ -566,6 +682,7 @@ async function saveDeezerConfig(event) {
     state.showDeezerSetup = false;
     el("deezer-app-secret").value = "";
     renderDeezerSection();
+    refreshSourceIfNeeded("deezer");
     banner("Configuration Deezer enregistrée. Connectez votre compte.", "ok");
   } catch (err) {
     banner(err.message, "error");
@@ -584,6 +701,7 @@ async function disconnectDeezer() {
     state.deezer.playlists = [];
     state.deezer.playlistsLoaded = false;
     renderDeezerSection();
+    refreshSourceIfNeeded("deezer");
     banner("Compte Deezer déconnecté.", "");
   } catch (err) {
     banner(err.message, "error");
@@ -638,7 +756,7 @@ function renderYouTubeSection() {
   const youtube = state.youtube;
   const setupVisible = !youtube.configured || state.showYouTubeSetup;
   el("youtube-setup").classList.toggle("hidden", !setupVisible);
-  el("youtube-setup-details").open = setupVisible;
+  el("youtube-setup-details").open = state.showYouTubeSetup;
   el("youtube-connect").classList.toggle("hidden", !youtube.configured || youtube.authenticated);
   el("youtube-connected").classList.toggle("hidden", !youtube.authenticated);
   el("youtube-target").classList.toggle("hidden", !youtube.authenticated);
@@ -677,6 +795,7 @@ async function saveYouTubeConfig(event) {
     state.showYouTubeSetup = false;
     el("youtube-client-secret").value = "";
     renderYouTubeSection();
+    refreshSourceIfNeeded("youtube_music");
     banner("Configuration YouTube Music enregistrée. Connectez votre compte.", "ok");
   } catch (err) {
     banner(err.message, "error");
@@ -729,6 +848,7 @@ async function connectYouTubeMusic() {
           state.youtube.deviceTimer = null;
           el("youtube-device").classList.add("hidden");
           renderYouTubeSection();
+          refreshSourceIfNeeded("youtube_music");
           banner("Connexion à YouTube Music réussie.", "ok");
         } else {
           state.youtube.deviceTimer = null;
@@ -758,6 +878,7 @@ async function disconnectYouTubeMusic() {
     state.youtube.deviceFlowId = null;
     el("youtube-device").classList.add("hidden");
     renderYouTubeSection();
+    refreshSourceIfNeeded("youtube_music");
     banner("Compte YouTube Music déconnecté.", "");
   } catch (err) {
     banner(err.message, "error");
@@ -819,6 +940,21 @@ async function startMerge() {
   }
 
   const provider = currentProvider();
+  const sourceProvider = currentSourceProvider();
+  if (!providerReady(sourceProvider)) {
+    errorNode.textContent = sourceStatusMessage(sourceProvider);
+    errorNode.classList.remove("hidden");
+    return;
+  }
+  if (!providerReady(provider)) {
+    const destinationInfo = providerState(provider);
+    const destinationLabel = providerLabels[provider] || provider;
+    errorNode.textContent = destinationInfo.configured
+      ? `Connectez ${destinationLabel} dans la section Connexions aux fournisseurs.`
+      : `Configurez ${destinationLabel} dans la section Connexions aux fournisseurs.`;
+    errorNode.classList.remove("hidden");
+    return;
+  }
   let target;
   if (provider === "spotify") {
     const mode = currentTargetMode("spotify");
@@ -957,11 +1093,17 @@ async function startMerge() {
 
   el("start-btn").disabled = true;
   el("result-card").classList.add("hidden");
-  el("progress-title").textContent = provider !== "spotify" ? "Transfert en cours…" : "Fusion en cours…";
+  el("progress-title").textContent =
+    sourceProvider !== provider ? "Transfert en cours…" : "Fusion en cours…";
   try {
     const data = await api("/api/merge", {
       method: "POST",
-      body: JSON.stringify({ playlist_ids: ids, target, options }),
+      body: JSON.stringify({
+        source: sourceProvider,
+        playlist_ids: ids,
+        target,
+        options,
+      }),
     });
     state.jobId = data.job_id;
     el("progress-card").classList.remove("hidden");
@@ -1024,36 +1166,43 @@ function renderResult(job) {
   const result = job.result || {};
   const stats = result.stats || {};
   const cancelled = job.status === "cancelled";
-  const isExternal = result.provider !== "spotify";
-  const providerLabel = result.provider_label || (isExternal ? "le fournisseur" : "Spotify");
+  const sourceProvider = result.source_provider || "spotify";
+  const sourceLabel =
+    result.source_label || providerLabels[sourceProvider] || sourceProvider;
+  const providerLabel =
+    result.provider_label ||
+    providerLabels[result.provider] ||
+    "le fournisseur";
+  const isTransfer = sourceProvider !== result.provider;
 
   el("result-title").textContent = result.dry_run
     ? "Simulation terminée"
-    : isExternal
+    : isTransfer
       ? "Transfert terminé"
       : "Fusion terminée";
 
   let sub = "";
   if (cancelled) sub = "Opération annulée. ";
-  const destination = isExternal ? " sur " + providerLabel : "";
+  const route = isTransfer ? " depuis " + sourceLabel : "";
   if (result.dry_run) {
-    sub += `${result.to_add} morceau(x) unique(s) seraient ajoutés à « ${result.playlist_name} »${destination}. Aucune modification n'a été effectuée.`;
+    sub += `${result.to_add} morceau(x) unique(s) seraient ajoutés à « ${result.playlist_name} » sur ${providerLabel}${route}. Aucune modification n'a été effectuée.`;
   } else if (result.added != null) {
-    sub += `${result.added} morceau(x) ajouté(s) à « ${result.playlist_name} »${destination}.`;
+    sub += `${result.added} morceau(x) ajouté(s) à « ${result.playlist_name} » sur ${providerLabel}${route}.`;
   }
   el("result-sub").textContent = sub;
 
-  const rows = [[isExternal ? "Morceaux à ajouter" : "Morceaux uniques retenus", result.to_add]];
-  if (isExternal) {
+  const rows = [[isTransfer ? "Morceaux à ajouter" : "Morceaux uniques retenus", result.to_add]];
+  if (stats.matched_direct) {
+    rows.push(["Correspondances directes", stats.matched_direct]);
+  }
+  if (isTransfer) {
     if (result.provider !== "youtube_music") {
       rows.push(["Correspondances exactes (ISRC)", stats.matched_isrc]);
     }
     rows.push(["Correspondances par recherche", stats.matched_search]);
-    rows.push(["Introuvables sur " + providerLabel, stats.unmatched]);
-    rows.push(["Doublons ignorés (entre sources)", stats.duplicates]);
-  } else {
-    rows.push(["Doublons ignorés (entre playlists)", stats.duplicates]);
   }
+  rows.push(["Introuvables sur " + providerLabel, stats.unmatched]);
+  rows.push(["Doublons ignorés", stats.duplicates]);
   rows.push(["Déjà dans la playlist cible", stats.already_in_target]);
   rows.push(["Épisodes ignorés", stats.episodes]);
   rows.push(["Fichiers locaux ignorés", stats.local_files]);
@@ -1070,9 +1219,8 @@ function renderResult(job) {
   const linkWrap = el("result-link-wrap");
   if (result.playlist_url && !result.dry_run) {
     el("result-link").href = result.playlist_url;
-    el("result-link").textContent = isExternal
-      ? "Ouvrir la playlist dans " + providerLabel
-      : "Ouvrir la playlist dans Spotify";
+    el("result-link").textContent =
+      "Ouvrir la playlist dans " + providerLabel;
     linkWrap.classList.remove("hidden");
   } else {
     linkWrap.classList.add("hidden");
@@ -1155,7 +1303,17 @@ el("logout-btn").addEventListener("click", async () => {
   window.location.href = "/";
 });
 
+el("spotify-setup-btn").addEventListener("click", () => showView("setup"));
+el("setup-back-btn").addEventListener("click", () => showView("merger"));
+el("login-back-btn").addEventListener("click", () => showView("merger"));
+
 el("filter").addEventListener("input", renderPlaylists);
+
+el("source-provider-select").addEventListener("change", () => {
+  state.sourceProvider = currentSourceProvider();
+  window.sessionStorage.setItem("sourceProvider", state.sourceProvider);
+  loadSourcePlaylists();
+});
 
 el("select-all").addEventListener("change", (event) => {
   if (event.target.checked) {
@@ -1169,7 +1327,10 @@ el("select-all").addEventListener("change", (event) => {
 });
 
 document.querySelectorAll('input[name="target-provider"]').forEach((radio) => {
-  radio.addEventListener("change", syncProviderFields);
+  radio.addEventListener("change", () => {
+    window.sessionStorage.setItem("targetProvider", radio.value);
+    syncProviderFields();
+  });
 });
 
 document.querySelectorAll('input[name="spotify-target-mode"]').forEach((radio) => {

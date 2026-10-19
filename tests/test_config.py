@@ -131,6 +131,61 @@ class ConfigTests(unittest.TestCase):
         response = self.client.post("/api/youtube/device")
         self.assertEqual(response.status_code, 400)
 
+    def test_playlists_rejects_unknown_provider(self):
+        response = self.client.get("/api/playlists?provider=unknown")
+        self.assertEqual(response.status_code, 400)
+
+    def test_playlists_requires_provider_configuration(self):
+        response = self.client.get("/api/playlists?provider=deezer")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Deezer", response.get_json()["error"])
+
+    def test_playlists_uses_selected_source_provider(self):
+        class FakeProvider:
+            label = "Deezer"
+
+            def is_configured(self):
+                return True
+
+            def is_authenticated(self):
+                return True
+
+            def list_playlists(self):
+                return [{
+                    "id": "dz1",
+                    "name": "Playlist Deezer",
+                    "track_count": 1,
+                    "can_read": True,
+                    "can_edit": True,
+                }]
+
+        with mock.patch.object(
+            app_module, "get_music_provider", return_value=FakeProvider()
+        ):
+            response = self.client.get("/api/playlists?provider=deezer")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["provider"], "deezer")
+        self.assertEqual(payload["playlists"][0]["name"], "Playlist Deezer")
+
+    def test_merge_rejects_unknown_source(self):
+        response = self.client.post("/api/merge", json={
+            "source": "unknown",
+            "playlist_ids": ["playlist"],
+            "target": {"provider": "spotify", "mode": "new", "name": "Test"},
+        })
+        self.assertEqual(response.status_code, 400)
+
+    def test_merge_requires_source_connection(self):
+        self.client.post("/api/client-id", json={"client_id": "spotify-client"})
+        response = self.client.post("/api/merge", json={
+            "source": "spotify",
+            "playlist_ids": ["playlist"],
+            "target": {"provider": "spotify", "mode": "new", "name": "Test"},
+        })
+        self.assertEqual(response.status_code, 401)
+        self.assertIn("Connectez votre compte Spotify", response.get_json()["error"])
+
     def test_youtube_device_flow_saves_token(self):
         self.client.post("/api/youtube/config", json={
             "client_id": "google-client",

@@ -22,9 +22,10 @@ from deezer_client import (
     build_authorize_url as build_deezer_authorize_url,
 )
 from providers import (
-    AppleMusicDestination,
-    DeezerDestination,
-    YouTubeMusicDestination,
+    AppleMusicProvider,
+    DeezerProvider,
+    SpotifyProvider,
+    YouTubeMusicProvider,
 )
 from spotify_client import (
     SpotifyAPIError,
@@ -60,11 +61,9 @@ APPLE_ORIGINS = [ORIGIN, "http://localhost:{}".format(PORT)]
 REDIRECT_URI = ORIGIN + "/callback"
 DEEZER_REDIRECT_URI = ORIGIN + "/deezer/callback"
 
-BATCH_SIZE = 100
-MAX_PLAYLIST_ITEMS = 10000
 DUP_PREVIEW_LIMIT = 50
 
-TARGET_PROVIDERS = ("spotify", "apple_music", "deezer", "youtube_music")
+MUSIC_PROVIDERS = ("spotify", "apple_music", "deezer", "youtube_music")
 YOUTUBE_FLOWS = {}
 YOUTUBE_FLOWS_LOCK = threading.Lock()
 YOUTUBE_FLOW_TTL = 1800
@@ -112,20 +111,46 @@ def get_youtube_client():
     return YouTubeMusicClient(load_config(), YOUTUBE_TOKEN_PATH)
 
 
-def get_destination_adapter(provider):
+def get_music_provider(provider):
+    if provider == "spotify":
+        return SpotifyProvider(get_client())
     if provider == "apple_music":
-        return AppleMusicDestination(get_apple_client())
+        return AppleMusicProvider(get_apple_client())
     if provider == "deezer":
-        return DeezerDestination(get_deezer_client())
+        return DeezerProvider(get_deezer_client())
     if provider == "youtube_music":
-        return YouTubeMusicDestination(get_youtube_client())
-    raise ValueError("Fournisseur de destination inconnu : {}".format(provider))
+        return YouTubeMusicProvider(get_youtube_client())
+    raise ValueError("Fournisseur de musique inconnu : {}".format(provider))
 
 
-def track_label(item):
-    artists = ", ".join(a.get("name", "") for a in item.get("artists") or [])
-    name = item.get("name") or item.get("uri") or "?"
-    return "{} — {}".format(artists or "?", name)
+AUTH_ERRORS = (
+    SpotifyAuthError,
+    AppleMusicAuthError,
+    DeezerAuthError,
+    YouTubeMusicAuthError,
+)
+CONFIG_ERRORS = (
+    SpotifyAuthError,
+    AppleMusicConfigError,
+    DeezerConfigError,
+    YouTubeMusicConfigError,
+)
+API_ERRORS = (
+    SpotifyAPIError,
+    AppleMusicAPIError,
+    DeezerAPIError,
+    YouTubeMusicAPIError,
+)
+
+
+def provider_error_response(exc):
+    if isinstance(exc, AUTH_ERRORS):
+        return jsonify({"error": str(exc)}), 401
+    if isinstance(exc, CONFIG_ERRORS):
+        return jsonify({"error": str(exc)}), 400
+    if isinstance(exc, API_ERRORS):
+        return jsonify({"error": getattr(exc, "message", str(exc))}), 502
+    raise exc
 
 
 def chunks(seq, size):
@@ -269,41 +294,23 @@ def api_logout():
 
 @app.route("/api/playlists")
 def api_playlists():
+    provider_id = request.args.get("provider") or "spotify"
+    if provider_id not in MUSIC_PROVIDERS:
+        return jsonify({"error": "Fournisseur source inconnu."}), 400
     try:
-        client = get_client()
-        me = client.me()
-        raw_playlists = client.all_playlists()
-    except SpotifyAuthError as exc:
-        return jsonify({"error": str(exc)}), 401
-    except SpotifyAPIError as exc:
-        return jsonify({"error": exc.message}), 502
-
-    my_id = me.get("id")
-    playlists = []
-    for pl in raw_playlists:
-        owner = pl.get("owner") or {}
-        total = None
-        items = pl.get("items")
-        if isinstance(items, dict):
-            total = items.get("total")
-        if total is None:
-            legacy = pl.get("tracks")
-            if isinstance(legacy, dict):
-                total = legacy.get("total")
-        owned = owner.get("id") == my_id
-        collaborative = bool(pl.get("collaborative"))
-        images = pl.get("images") or []
-        playlists.append({
-            "id": pl.get("id"),
-            "name": pl.get("name") or "(sans titre)",
-            "track_count": total,
-            "owner": owner.get("display_name") or owner.get("id") or "?",
-            "owned": owned,
-            "collaborative": collaborative,
-            "can_read": owned or collaborative,
-            "image": images[0].get("url") if images else None,
-        })
-    return jsonify({"playlists": playlists})
+        provider = get_music_provider(provider_id)
+        if not provider.is_configured():
+            return jsonify({
+                "error": "{} n'est pas configuré.".format(provider.label)
+            }), 400
+        if not provider.is_authenticated():
+            return jsonify({
+                "error": "Compte {} non connecté.".format(provider.label)
+            }), 401
+        playlists = provider.list_playlists()
+    except Exception as exc:  # noqa: BLE001 - converti en réponse HTTP
+        return provider_error_response(exc)
+    return jsonify({"provider": provider_id, "playlists": playlists})
 
 
 # ---------------------------------------------------------------- Apple Music
@@ -481,7 +488,7 @@ def api_deezer_config():
 def deezer_login():
     client = get_deezer_client()
     if not client.is_configured():
-        return redirect("/?deezer_error=config&provider=deezer")
+        return redirect("/?deezer_error=config")
     state = secrets.token_urlsafe(24)
     session["deezer_oauth_state"] = state
     return redirect(
@@ -492,17 +499,17 @@ def deezer_login():
 @app.route("/deezer/callback")
 def deezer_callback():
     if request.args.get("error"):
-        return redirect("/?deezer_error=denied&provider=deezer")
+        return redirect("/?deezer_error=denied")
     code = request.args.get("code")
     state = request.args.get("state")
     expected_state = session.pop("deezer_oauth_state", None)
     if not code or (expected_state and state != expected_state):
-        return redirect("/?deezer_error=state&provider=deezer")
+        return redirect("/?deezer_error=state")
     try:
         get_deezer_client().exchange_code(code, DEEZER_REDIRECT_URI)
     except (DeezerAuthError, DeezerConfigError):
-        return redirect("/?deezer_error=auth&provider=deezer")
-    return redirect("/?deezer_connected=1&provider=deezer")
+        return redirect("/?deezer_error=auth")
+    return redirect("/?deezer_connected=1")
 
 
 @app.route("/api/deezer/logout", methods=["POST"])
@@ -740,8 +747,12 @@ def api_merge():
 
     target = data.get("target") or {}
     provider = target.get("provider") or "spotify"
-    if provider not in TARGET_PROVIDERS:
+    if provider not in MUSIC_PROVIDERS:
         return jsonify({"error": "Fournisseur de destination inconnu."}), 400
+
+    source_id = data.get("source") or "spotify"
+    if source_id not in MUSIC_PROVIDERS:
+        return jsonify({"error": "Fournisseur source inconnu."}), 400
 
     mode = target.get("mode")
     if mode not in ("new", "existing"):
@@ -751,24 +762,30 @@ def api_merge():
     if mode == "existing" and not target.get("id"):
         return jsonify({"error": "Choisissez une playlist existante."}), 400
 
-    if provider == "apple_music":
-        apple = get_apple_client()
-        if not apple.is_configured():
-            return jsonify({"error": "Configurez d'abord Apple Music (Team ID, Key ID et clé .p8)."}), 400
-        if not apple.is_authenticated():
-            return jsonify({"error": "Connectez votre compte Apple Music avant de lancer le transfert."}), 401
-    elif provider == "deezer":
-        deezer = get_deezer_client()
-        if not deezer.is_configured():
-            return jsonify({"error": "Configurez d'abord votre application Deezer (App ID et App Secret)."}), 400
-        if not deezer.is_authenticated():
-            return jsonify({"error": "Connectez votre compte Deezer avant de lancer le transfert."}), 401
-    elif provider == "youtube_music":
-        youtube = get_youtube_client()
-        if not youtube.is_configured():
-            return jsonify({"error": "Configurez d'abord YouTube Music (Client ID et Client Secret Google)."}), 400
-        if not youtube.is_authenticated():
-            return jsonify({"error": "Connectez votre compte YouTube Music avant de lancer le transfert."}), 401
+    try:
+        source = get_music_provider(source_id)
+        destination = get_music_provider(provider)
+    except Exception as exc:  # noqa: BLE001 - converti en réponse HTTP
+        return provider_error_response(exc)
+
+    if not source.is_configured():
+        return jsonify({"error": "Configurez d'abord {}.".format(source.label)}), 400
+    if not source.is_authenticated():
+        return jsonify({
+            "error": "Connectez votre compte {} avant de lancer l'opération.".format(
+                source.label
+            )
+        }), 401
+    if not destination.is_configured():
+        return jsonify({
+            "error": "Configurez d'abord {}.".format(destination.label)
+        }), 400
+    if not destination.is_authenticated():
+        return jsonify({
+            "error": "Connectez votre compte {} avant de lancer l'opération.".format(
+                destination.label
+            )
+        }), 401
 
     raw_options = data.get("options") or {}
     options = {
@@ -778,31 +795,34 @@ def api_merge():
     }
 
     try:
-        client = get_client()
-        me = client.me()
-    except SpotifyAuthError as exc:
-        return jsonify({"error": str(exc)}), 401
-    except SpotifyAPIError as exc:
-        return jsonify({"error": exc.message}), 502
+        source_playlists = source.list_playlists()
+    except Exception as exc:  # noqa: BLE001 - converti en réponse HTTP
+        return provider_error_response(exc)
 
-    try:
-        names = {pl.get("id"): pl.get("name") or "(sans titre)" for pl in client.all_playlists()}
-    except SpotifyAuthError as exc:
-        return jsonify({"error": str(exc)}), 401
-    except SpotifyAPIError as exc:
-        return jsonify({"error": exc.message}), 502
+    source_map = {
+        playlist.get("id"): playlist for playlist in source_playlists
+    }
+    for playlist_id in playlist_ids:
+        playlist = source_map.get(playlist_id)
+        if not playlist or not playlist.get("can_read", True):
+            return jsonify({
+                "error": "Certaines playlists sélectionnées sont introuvables ou illisibles."
+            }), 400
 
-    sources = [{"id": pid, "name": names.get(pid, pid)} for pid in playlist_ids]
-    if len(sources) != len(playlist_ids):
-        return jsonify({"error": "Certaines playlists sélectionnées sont introuvables."}), 400
+    sources = [
+        {
+            "id": playlist_id,
+            "name": source_map[playlist_id].get("name") or "(sans titre)",
+        }
+        for playlist_id in playlist_ids
+    ]
 
     if provider == "spotify" and mode == "existing":
         try:
-            playlist = client.get_playlist(target["id"])
-        except SpotifyAuthError as exc:
-            return jsonify({"error": str(exc)}), 401
-        except SpotifyAPIError as exc:
-            return jsonify({"error": exc.message}), 502
+            me = destination.client.me()
+            playlist = destination.client.get_playlist(target["id"])
+        except Exception as exc:  # noqa: BLE001 - converti en réponse HTTP
+            return provider_error_response(exc)
         owner = (playlist.get("owner") or {}).get("id")
         if owner != me.get("id") and not playlist.get("collaborative"):
             return jsonify({
@@ -816,6 +836,8 @@ def api_merge():
         "message": "Préparation…",
         "progress": {"done": 0, "total": len(sources)},
         "added": 0,
+        "source_provider": source_id,
+        "destination_provider": provider,
         "provider": provider,
         "result": None,
         "error": None,
@@ -824,10 +846,9 @@ def api_merge():
     with JOBS_LOCK:
         JOBS[job_id] = job
 
-    client_id = load_config()["client_id"]
     worker = threading.Thread(
         target=run_merge,
-        args=(job_id, client_id, provider, sources, target, options),
+        args=(job_id, source_id, provider, sources, target, options),
         daemon=True,
     )
     worker.start()
@@ -857,15 +878,17 @@ def api_merge_cancel(job_id):
     return jsonify({"ok": True})
 
 
-def run_merge(job_id, client_id, provider, sources, target, options):
+def run_merge(job_id, source_id, destination_id, sources, target, options):
     job = JOBS[job_id]
-    client = SpotifyClient(client_id, TOKENS_PATH)
-    destination = None
     try:
-        if provider != "spotify":
-            destination = get_destination_adapter(provider)
-        result = perform_merge(
-            client, destination, job, provider, sources, target, options
+        source = get_music_provider(source_id)
+        destination = (
+            source
+            if destination_id == source_id
+            else get_music_provider(destination_id)
+        )
+        result = perform_transfer(
+            source, destination, job, sources, target, options
         )
         job["result"] = result
         job["status"] = "cancelled" if job["cancel"] else "done"
@@ -911,18 +934,14 @@ def run_merge(job_id, client_id, provider, sources, target, options):
         job["error"] = "Erreur inattendue : {}".format(exc)
 
 
-def perform_merge(client, destination, job, provider, sources, target, options):
-    tracks, stats, dup_preview = collect_tracks(client, job, sources, options)
-    if provider == "spotify":
-        return perform_spotify_merge(
-            client, job, tracks, target, options, stats, dup_preview
-        )
-    return perform_external_transfer(
-        destination, job, tracks, target, options, stats, dup_preview
+def perform_transfer(source, destination, job, sources, target, options):
+    tracks, stats, dup_preview = collect_tracks(source, job, sources, options)
+    return perform_destination_transfer(
+        source, destination, job, tracks, target, options, stats, dup_preview
     )
 
 
-def collect_tracks(client, job, sources, options):
+def collect_tracks(source, job, sources, options):
     stats = {
         "tracks_read": 0,
         "duplicates": 0,
@@ -930,179 +949,85 @@ def collect_tracks(client, job, sources, options):
         "local_files": 0,
         "unavailable": 0,
         "already_in_target": 0,
+        "matched_direct": 0,
         "matched_isrc": 0,
         "matched_search": 0,
         "unmatched": 0,
         "skipped_playlists": [],
     }
     dup_preview = []
-    seen_uris = set()
+    seen_keys = set()
     seen_isrc = set()
     tracks = []
 
     job["phase"] = "collect"
     job["progress"] = {"done": 0, "total": len(sources)}
-    for index, source in enumerate(sources):
+    for index, source_playlist in enumerate(sources):
         if job["cancel"]:
             break
-        job["message"] = "Lecture de « {} » ({}/{})".format(
-            source["name"], index + 1, len(sources)
+        job["message"] = "Lecture de « {} » depuis {} ({}/{})".format(
+            source_playlist["name"], source.label, index + 1, len(sources)
         )
         try:
-            for entry in client.playlist_items(source["id"]):
-                item = entry.get("item") or entry.get("track")
-                if not item:
-                    stats["unavailable"] += 1
-                    continue
-                if item.get("type") != "track":
-                    stats["episodes"] += 1
-                    continue
-                if item.get("is_local") or entry.get("is_local"):
-                    stats["local_files"] += 1
-                    continue
-                uri = item.get("uri")
-                if not uri:
-                    stats["unavailable"] += 1
-                    continue
-                stats["tracks_read"] += 1
-                isrc = (item.get("external_ids") or {}).get("isrc")
-                duplicate = False
-                if options["dedupe"]:
-                    if uri in seen_uris:
-                        duplicate = True
-                    elif options["dedupe_isrc"] and isrc and isrc in seen_isrc:
-                        duplicate = True
-                if duplicate:
-                    stats["duplicates"] += 1
-                    if len(dup_preview) < DUP_PREVIEW_LIMIT:
-                        dup_preview.append(track_label(item))
-                    continue
-                seen_uris.add(uri)
-                if isrc:
-                    seen_isrc.add(isrc)
-                tracks.append({
-                    "uri": uri,
-                    "isrc": isrc,
-                    "title": item.get("name") or "",
-                    "artists": [
-                        artist.get("name")
-                        for artist in item.get("artists") or []
-                        if artist.get("name")
-                    ],
-                    "album": (item.get("album") or {}).get("name") or "",
-                    "duration_ms": item.get("duration_ms"),
-                    "label": track_label(item),
-                })
-        except SpotifyAPIError as exc:
-            if exc.status in (403, 404):
-                stats["skipped_playlists"].append(source["name"])
+            result = source.read_playlist(source_playlist["id"])
+        except Exception as exc:  # noqa: BLE001 - erreurs fournisseur
+            status = getattr(exc, "status", None)
+            if status in (403, 404, 800):
+                stats["skipped_playlists"].append(source_playlist["name"])
+                job["progress"]["done"] = index + 1
                 continue
             raise
+
+        stats["episodes"] += result.get("episodes", 0)
+        stats["local_files"] += result.get("local_files", 0)
+        stats["unavailable"] += result.get("unavailable", 0)
+
+        for track in result.get("tracks") or []:
+            stats["tracks_read"] += 1
+            isrc = (track.get("isrc") or "").strip() or None
+            key = (
+                track.get("source_key")
+                or track.get("direct_id")
+                or track.get("uri")
+                or isrc
+                or "{}|{}".format(
+                    "|".join(track.get("artists") or []).lower(),
+                    track.get("title") or "",
+                )
+            )
+            duplicate = False
+            if options["dedupe"]:
+                if key in seen_keys:
+                    duplicate = True
+                elif options["dedupe_isrc"] and isrc and isrc in seen_isrc:
+                    duplicate = True
+            if duplicate:
+                stats["duplicates"] += 1
+                if len(dup_preview) < DUP_PREVIEW_LIMIT:
+                    dup_preview.append(
+                        track.get("label")
+                        or "{} — {}".format(
+                            ", ".join(track.get("artists") or []) or "?",
+                            track.get("title") or "?",
+                        )
+                    )
+                continue
+            seen_keys.add(key)
+            if isrc:
+                seen_isrc.add(isrc)
+            track["source_provider"] = source.provider_id
+            tracks.append(track)
+
         job["progress"]["done"] = index + 1
 
     return tracks, stats, dup_preview
 
 
-def perform_spotify_merge(client, job, tracks, target, options, stats, dup_preview):
-    uris = [track["uri"] for track in tracks]
-    job["phase"] = "target"
-    created = False
-    target_id = None
-    playlist_name = target.get("name") or ""
-    target_url = None
-
-    if job["cancel"]:
-        return {
-            "provider": "spotify",
-            "provider_label": "Spotify",
-            "created": False,
-            "dry_run": options["dry_run"],
-            "playlist_id": None,
-            "playlist_url": None,
-            "playlist_name": playlist_name,
-            "to_add": len(uris),
-            "added": 0,
-            "stats": stats,
-            "dup_preview": dup_preview,
-        }
-
-    if target["mode"] == "new":
-        if not uris:
-            raise MergeError("Aucun morceau à ajouter : les playlists sélectionnées sont vides ou illisibles.")
-        if len(uris) > MAX_PLAYLIST_ITEMS:
-            raise MergeError(
-                "Impossible : la fusion contient {} morceaux, or Spotify limite les playlists à {} morceaux.".format(
-                    len(uris), MAX_PLAYLIST_ITEMS
-                )
-            )
-        if not options["dry_run"]:
-            job["message"] = "Création de la playlist « {} »…".format(target["name"].strip())
-            created_playlist = client.create_playlist(
-                target["name"].strip(),
-                bool(target.get("public")),
-                (target.get("description") or "").strip() or "Fusion générée par Spotify Playlist Merger",
-            )
-            target_id = created_playlist.get("id")
-            created = True
-            playlist_name = created_playlist.get("name") or target["name"]
-    else:
-        target_id = target["id"]
-        job["message"] = "Vérification du contenu existant de la playlist cible…"
-        try:
-            existing_uris = client.playlist_item_uris(target_id)
-        except SpotifyAPIError as exc:
-            if exc.status in (403, 404):
-                raise MergeError(
-                    "Impossible de lire le contenu de la playlist cible. Spotify ne permet de lire que vos playlists ou celles où vous collaborez."
-                )
-            raise
-        if options["dedupe"]:
-            stats["already_in_target"] = sum(1 for uri in uris if uri in existing_uris)
-            uris = [uri for uri in uris if uri not in existing_uris]
-        if len(existing_uris) + len(uris) > MAX_PLAYLIST_ITEMS:
-            raise MergeError(
-                "Impossible : la playlist cible contiendrait plus de {} morceaux.".format(MAX_PLAYLIST_ITEMS)
-            )
-        playlist_name = target.get("name") or "Playlist cible"
-
-    if target_id:
-        target_url = "https://open.spotify.com/playlist/{}".format(target_id)
-
-    result = {
-        "provider": "spotify",
-        "provider_label": "Spotify",
-        "created": created,
-        "dry_run": options["dry_run"],
-        "playlist_id": target_id,
-        "playlist_url": target_url,
-        "playlist_name": playlist_name,
-        "to_add": len(uris),
-        "added": 0,
-        "stats": stats,
-        "dup_preview": dup_preview,
-    }
-
-    if options["dry_run"]:
-        return result
-
-    job["phase"] = "add"
-    job["progress"] = {"done": 0, "total": len(uris)}
-    job["message"] = "Ajout des morceaux… 0/{}".format(len(uris))
-    for batch in chunks(uris, BATCH_SIZE):
-        if job["cancel"]:
-            break
-        client.add_items(target_id, batch)
-        job["added"] += len(batch)
-        job["progress"]["done"] = job["added"]
-        job["message"] = "Ajout des morceaux… {}/{}".format(job["added"], len(uris))
-    result["added"] = job["added"]
-    return result
-
-
-def perform_external_transfer(
-    adapter, job, tracks, target, options, stats, dup_preview
+def perform_destination_transfer(
+    source, destination, job, tracks, target, options, stats, dup_preview
 ):
-    """Transfère des morceaux Spotify vers un fournisseur externe."""
+    """Transfère des morceaux normalisés vers un fournisseur de destination."""
+    stats.setdefault("matched_direct", 0)
     unmatched_preview = []
     existing = {"ids": set(), "isrcs": set()}
     target_id = None
@@ -1110,18 +1035,18 @@ def perform_external_transfer(
 
     if target["mode"] == "existing":
         target_id = target["id"]
-        job["message"] = "Lecture de la playlist {} cible…".format(adapter.label)
+        job["message"] = "Lecture de la playlist {} cible…".format(destination.label)
         try:
-            existing = adapter.existing_tracks(target_id)
+            existing = destination.existing_tracks(target_id)
         except Exception as exc:  # noqa: BLE001 - erreurs normalisées ci-dessous
             status = getattr(exc, "status", None)
             if status in (403, 404, 800):
                 raise MergeError(
                     "Impossible de lire la playlist {} cible. Vérifiez qu'elle existe "
-                    "dans votre bibliothèque.".format(adapter.label)
+                    "dans votre bibliothèque.".format(destination.label)
                 )
             raise
-        playlist_name = target.get("name") or "Playlist {}".format(adapter.label)
+        playlist_name = target.get("name") or "Playlist {}".format(destination.label)
 
     cache = {}
     destination_ids = []
@@ -1133,22 +1058,33 @@ def perform_external_transfer(
     for index, track in enumerate(tracks):
         if job["cancel"]:
             break
-        cache_key = (
-            track["isrc"].upper()
-            if track.get("isrc")
-            else "{}|{}".format(
+        if (
+            track.get("source_provider") == destination.provider_id
+            and track.get("source_key")
+        ):
+            cache_key = "direct:{}".format(track["source_key"])
+        elif track.get("isrc"):
+            cache_key = "isrc:{}".format(track["isrc"].upper())
+        else:
+            cache_key = "search:{}|{}".format(
                 "|".join(track.get("artists") or []).lower(),
                 track.get("title") or "",
             )
-        )
+
         if cache_key in cache:
             destination_id, method = cache[cache_key]
         else:
-            destination_id, method = adapter.resolve_track(track)
+            destination_id, method = destination.resolve_track(track)
             cache[cache_key] = (destination_id, method)
 
         if destination_id:
-            stats["matched_isrc" if method == "isrc" else "matched_search"] += 1
+            if method == "direct":
+                stats["matched_direct"] += 1
+            elif method == "isrc":
+                stats["matched_isrc"] += 1
+            else:
+                stats["matched_search"] += 1
+
             isrc = (track.get("isrc") or "").upper()
             already = destination_id in existing["ids"] or (
                 isrc and isrc in existing["isrcs"]
@@ -1163,21 +1099,28 @@ def perform_external_transfer(
         else:
             stats["unmatched"] += 1
             if len(unmatched_preview) < DUP_PREVIEW_LIMIT:
-                unmatched_preview.append(track["label"])
+                unmatched_preview.append(track.get("label") or track.get("title") or "?")
 
         job["progress"]["done"] = index + 1
         if index % 3 == 0 or index + 1 == total:
-            job["message"] = "Recherche sur {}… {}/{} · {} trouvé(s)".format(
-                adapter.label, index + 1, total, len(destination_ids)
-            )
+            if source.provider_id == destination.provider_id:
+                job["message"] = "Préparation des morceaux… {}/{} · {} retenu(s)".format(
+                    index + 1, total, len(destination_ids)
+                )
+            else:
+                job["message"] = "Recherche sur {}… {}/{} · {} trouvé(s)".format(
+                    destination.label, index + 1, total, len(destination_ids)
+                )
 
     result = {
-        "provider": adapter.provider_id,
-        "provider_label": adapter.label,
+        "source_provider": source.provider_id,
+        "source_label": source.label,
+        "provider": destination.provider_id,
+        "provider_label": destination.label,
         "created": False,
         "dry_run": options["dry_run"],
         "playlist_id": target_id,
-        "playlist_url": adapter.playlist_url(target_id) if target_id else None,
+        "playlist_url": destination.playlist_url(target_id) if target_id else None,
         "playlist_name": playlist_name,
         "to_add": len(destination_ids),
         "added": 0,
@@ -1189,41 +1132,59 @@ def perform_external_transfer(
     if job["cancel"] or options["dry_run"]:
         return result
 
+    limit = destination.max_playlist_items
     if target["mode"] == "new":
         if not destination_ids:
             raise MergeError(
                 "Aucun morceau n'a pu être trouvé sur {} : la playlist serait vide.".format(
-                    adapter.label
+                    destination.label
+                )
+            )
+        if limit and len(destination_ids) > limit:
+            raise MergeError(
+                "Impossible : l'opération contient {} morceaux, or {} limite les playlists "
+                "à {} morceaux.".format(
+                    len(destination_ids), destination.label, limit
                 )
             )
         job["phase"] = "target"
         job["message"] = "Création de la playlist « {} » sur {}…".format(
-            target["name"].strip(), adapter.label
+            target["name"].strip(), destination.label
         )
-        created_playlist = adapter.create_playlist(
+        description = (target.get("description") or "").strip()
+        if not description:
+            description = "Playlist générée par Spotify Playlist Merger"
+        created_playlist = destination.create_playlist(
             target["name"].strip(),
-            (target.get("description") or "").strip(),
+            description,
             bool(target.get("public")),
         )
         target_id = created_playlist.get("id")
         if not target_id:
             raise MergeError(
                 "{} n'a pas renvoyé l'identifiant de la playlist créée.".format(
-                    adapter.label
+                    destination.label
                 )
             )
         result["created"] = True
         result["playlist_id"] = target_id
-        result["playlist_url"] = adapter.playlist_url(target_id)
+        result["playlist_url"] = destination.playlist_url(target_id)
         result["playlist_name"] = created_playlist.get("name") or target["name"]
+    else:
+        if limit and len(existing["ids"]) + len(destination_ids) > limit:
+            raise MergeError(
+                "Impossible : la playlist cible contiendrait plus de {} morceaux.".format(
+                    limit
+                )
+            )
 
     job["phase"] = "add"
     job["progress"] = {"done": 0, "total": len(destination_ids)}
     job["message"] = "Ajout des morceaux… 0/{}".format(len(destination_ids))
-    for batch in chunks(destination_ids, adapter.batch_size):
+    for batch in chunks(destination_ids, destination.batch_size):
         if job["cancel"]:
             break
-        adapter.add_tracks(target_id, batch)
+        destination.add_tracks(target_id, batch)
         job["added"] += len(batch)
         job["progress"]["done"] = job["added"]
         job["message"] = "Ajout des morceaux… {}/{}".format(

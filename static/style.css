@@ -193,6 +193,28 @@ input[type="text"]:focus, input[type="password"]:focus, select:focus { border-co
   margin: 12px 0;
 }
 
+.connections-card { margin-bottom: 18px; }
+.connection-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+  align-items: start;
+}
+.connection-block { min-width: 0; }
+.connection-block h3 { margin: 0 0 8px; font-size: 14px; }
+.connections-card .provider-box { margin: 0; }
+
+.source-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 4px 0 10px;
+}
+.source-row label { font-size: 13px; color: var(--muted); white-space: nowrap; }
+.source-row select { max-width: 230px; }
+#source-status { min-height: 18px; }
+
 .provider-box .row { flex-wrap: wrap; }
 .provider-box .row .btn { flex: 0 0 auto; }
 

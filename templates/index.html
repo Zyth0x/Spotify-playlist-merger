@@ -42,6 +42,7 @@
         <button class="btn" type="submit">Enregistrer</button>
       </form>
       <p class="muted small">Le Client ID est stocké uniquement en local dans <code>data/config.json</code>.</p>
+      <button id="setup-back-btn" class="btn ghost small" type="button">Retour à l'application</button>
     </div>
   </section>
 
@@ -57,68 +58,34 @@
           <button class="btn ghost" type="submit">Enregistrer</button>
         </form>
       </details>
+      <button id="login-back-btn" class="btn ghost small" type="button">Retour à l'application</button>
     </div>
   </section>
 
   <section id="view-merger" class="view hidden">
-    <div class="layout">
-      <div class="card playlists-card">
-        <h2>1 · Playlists Spotify à fusionner / transférer</h2>
-        <div class="toolbar">
-          <input id="filter" type="text" placeholder="Filtrer par nom…" autocomplete="off">
-          <label class="check-line"><input type="checkbox" id="select-all"> Tout sélectionner</label>
-        </div>
-        <p class="muted small"><span id="selection-count">0 sélectionnée</span></p>
-        <ul id="playlist-list" class="playlist-list"></ul>
-        <p class="muted small">Note : Spotify (mode développement) ne permet de lire que les playlists que vous possédez
-        ou auxquelles vous collaborez. Les playlists suivies par d'autres sont désactivées.</p>
-      </div>
-
-      <div class="card config-card">
-        <h2>2 · Destination</h2>
-        <div class="provider-switch">
-          <label class="provider-option">
-            <input type="radio" name="target-provider" value="spotify" checked>
-            <span class="provider-name">Spotify</span>
-            <span class="provider-sub">Fusionner dans Spotify</span>
-          </label>
-          <label class="provider-option">
-            <input type="radio" name="target-provider" value="apple_music">
-            <span class="provider-name">Apple Music</span>
-            <span class="provider-sub">Transférer vers Apple Music</span>
-          </label>
-          <label class="provider-option">
-            <input type="radio" name="target-provider" value="deezer">
-            <span class="provider-name">Deezer</span>
-            <span class="provider-sub">Transférer vers Deezer</span>
-          </label>
-          <label class="provider-option">
-            <input type="radio" name="target-provider" value="youtube_music">
-            <span class="provider-name">YouTube Music</span>
-            <span class="provider-sub">Transférer vers YouTube Music</span>
-          </label>
-        </div>
-        <p class="muted small">Amazon Music et Tidal ne sont pas proposés : leurs API de gestion de
-        playlists nécessitent un accès partenaire spécifique.</p>
-
-        <div id="provider-spotify">
-          <label class="radio-line"><input type="radio" name="spotify-target-mode" value="new" checked> Créer une nouvelle playlist</label>
-          <div id="new-fields" class="field-group">
-            <input id="new-name" type="text" placeholder="Nom de la playlist" value="Ma playlist globale">
-            <input id="new-desc" type="text" placeholder="Description (optionnel)">
-            <label class="check-line"><input type="checkbox" id="new-public"> Playlist publique</label>
-          </div>
-          <label class="radio-line"><input type="radio" name="spotify-target-mode" value="existing"> Utiliser une playlist existante</label>
-          <div id="existing-fields" class="field-group hidden">
-            <select id="target-select"></select>
-            <p class="muted small">Seules vos playlists (ou collaborations) modifiables apparaissent ici.</p>
+    <div class="card connections-card">
+      <h2>Connexions aux fournisseurs</h2>
+      <p class="muted small">Connectez ici les fournisseurs utilisés comme source ou destination.
+      Chaque fournisseur peut être configuré et connecté indépendamment.</p>
+      <div class="connection-grid">
+        <div class="connection-block">
+          <h3>Spotify</h3>
+          <div id="spotify-connection">
+            <div id="spotify-not-configured" class="provider-box hidden">
+              <p class="muted small">Spotify n'est pas encore configuré.</p>
+              <button id="spotify-setup-btn" class="btn small" type="button">Configurer Spotify</button>
+            </div>
+            <div id="spotify-not-connected" class="provider-box hidden">
+              <p class="muted small">Application Spotify configurée. Connectez votre compte.</p>
+              <a class="btn small" href="/login">Se connecter avec Spotify</a>
+            </div>
+            <div id="spotify-connected" class="provider-box hidden">
+              <p class="muted small">Connecté à Spotify <span id="spotify-user-name"></span>.</p>
+            </div>
           </div>
         </div>
-
-        <div id="provider-apple" class="hidden">
-          <p class="muted small">Le transfert lit vos playlists Spotify puis recrée la sélection dans Apple Music.
-          Chaque morceau est d'abord recherché par ISRC, puis par titre et artiste.</p>
-
+        <div class="connection-block">
+          <h3>Apple Music</h3>
           <div id="apple-setup" class="provider-box hidden">
             <p class="muted small">Apple Music nécessite un compte <strong>Apple Developer Program</strong> (MusicKit),
             une clé privée <code>.p8</code> et un abonnement Apple Music actif.</p>
@@ -166,28 +133,10 @@
             </div>
           </div>
 
-          <div id="apple-target" class="hidden">
-            <label class="radio-line"><input type="radio" name="apple-target-mode" value="new" checked> Créer une nouvelle playlist</label>
-            <div id="apple-new-fields" class="field-group">
-              <input id="apple-new-name" type="text" placeholder="Nom de la playlist" value="Ma playlist Apple Music">
-              <input id="apple-new-desc" type="text" placeholder="Description (optionnel)">
-              <label class="check-line"><input type="checkbox" id="apple-new-public"> Playlist publique (si disponible)</label>
-            </div>
-            <label class="radio-line"><input type="radio" name="apple-target-mode" value="existing"> Utiliser une playlist Apple Music existante</label>
-            <div id="apple-existing-fields" class="field-group hidden">
-              <select id="apple-target-select"></select>
-              <p class="muted small">Vos playlists de la bibliothèque Apple Music.</p>
-            </div>
-            <p class="muted small">Les morceaux introuvables sont ignorés et listés dans le résultat.
-            Le mode simulation permet de tout vérifier avant de créer la playlist.</p>
-          </div>
+
         </div>
-
-        <div id="provider-deezer" class="hidden">
-          <p class="muted small">Deezer utilise OAuth : créez une application sur le
-          <a href="https://developers.deezer.com/" target="_blank" rel="noopener">portail développeur Deezer</a>,
-          puis autorisez votre compte. Chaque morceau est recherché par ISRC, puis par titre et artiste.</p>
-
+        <div class="connection-block">
+          <h3>Deezer</h3>
           <div id="deezer-setup" class="provider-box hidden">
             <details id="deezer-setup-details" class="setup-details">
               <summary>Configuration Deezer</summary>
@@ -223,27 +172,10 @@
             </div>
           </div>
 
-          <div id="deezer-target" class="hidden">
-            <label class="radio-line"><input type="radio" name="deezer-target-mode" value="new" checked> Créer une nouvelle playlist</label>
-            <div id="deezer-new-fields" class="field-group">
-              <input id="deezer-new-name" type="text" placeholder="Nom de la playlist" value="Ma playlist Deezer">
-              <input id="deezer-new-desc" type="text" placeholder="Description (optionnel)">
-            </div>
-            <label class="radio-line"><input type="radio" name="deezer-target-mode" value="existing"> Utiliser une playlist Deezer existante</label>
-            <div id="deezer-existing-fields" class="field-group hidden">
-              <select id="deezer-target-select"></select>
-              <p class="muted small">Vos playlists Deezer modifiables.</p>
-            </div>
-            <p class="muted small">Les morceaux introuvables sont ignorés et listés dans le résultat.</p>
-          </div>
+
         </div>
-
-        <div id="provider-youtube" class="hidden">
-          <p class="muted small">YouTube Music n'a pas d'API officielle de gestion des playlists :
-          l'application utilise <code>ytmusicapi</code> avec une autorisation Google OAuth.
-          Cette intégration non officielle peut cesser de fonctionner si Google modifie son service.
-          Les morceaux sont retrouvés par titre, artiste et durée.</p>
-
+        <div class="connection-block">
+          <h3>YouTube Music</h3>
           <div id="youtube-setup" class="provider-box hidden">
             <p class="muted small">Dans la
             <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener">Google Cloud Console</a>,
@@ -284,6 +216,125 @@
               <button id="youtube-reconfigure-btn-2" class="btn ghost small" type="button">Reconfigurer</button>
             </div>
           </div>
+
+
+        </div>
+      </div>
+    </div>
+
+    <div class="layout">
+      <div class="card playlists-card">
+        <h2>1 · Playlists source</h2>
+        <div class="source-row">
+          <label for="source-provider-select">Fournisseur source</label>
+          <select id="source-provider-select">
+            <option value="spotify">Spotify</option>
+            <option value="apple_music">Apple Music</option>
+            <option value="deezer">Deezer</option>
+            <option value="youtube_music">YouTube Music</option>
+          </select>
+        </div>
+        <p id="source-status" class="muted small"></p>
+
+        <div class="toolbar">
+          <input id="filter" type="text" placeholder="Filtrer par nom…" autocomplete="off">
+          <label class="check-line"><input type="checkbox" id="select-all"> Tout sélectionner</label>
+        </div>
+        <p class="muted small"><span id="selection-count">0 sélectionnée</span></p>
+        <ul id="playlist-list" class="playlist-list"></ul>
+        <p class="muted small">Seules les playlists accessibles avec le compte connecté sont proposées.
+        Selon le fournisseur, certaines playlists suivies peuvent être en lecture seule.</p>
+      </div>
+
+      <div class="card config-card">
+        <h2>2 · Destination</h2>
+        <div class="provider-switch">
+          <label class="provider-option">
+            <input type="radio" name="target-provider" value="spotify" checked>
+            <span class="provider-name">Spotify</span>
+            <span class="provider-sub">Fusionner dans Spotify</span>
+          </label>
+          <label class="provider-option">
+            <input type="radio" name="target-provider" value="apple_music">
+            <span class="provider-name">Apple Music</span>
+            <span class="provider-sub">Transférer vers Apple Music</span>
+          </label>
+          <label class="provider-option">
+            <input type="radio" name="target-provider" value="deezer">
+            <span class="provider-name">Deezer</span>
+            <span class="provider-sub">Transférer vers Deezer</span>
+          </label>
+          <label class="provider-option">
+            <input type="radio" name="target-provider" value="youtube_music">
+            <span class="provider-name">YouTube Music</span>
+            <span class="provider-sub">Transférer vers YouTube Music</span>
+          </label>
+        </div>
+        <p class="muted small">La configuration et la connexion des fournisseurs se font dans la section
+        <strong>Connexions aux fournisseurs</strong>, en haut de la page. Quand la source et la destination
+        sont identiques, les morceaux sont ajoutés directement. Amazon Music et Tidal ne sont pas proposés :
+        leurs API de gestion de playlists nécessitent un accès partenaire spécifique.</p>
+
+        <div id="provider-spotify">
+          <label class="radio-line"><input type="radio" name="spotify-target-mode" value="new" checked> Créer une nouvelle playlist</label>
+          <div id="new-fields" class="field-group">
+            <input id="new-name" type="text" placeholder="Nom de la playlist" value="Ma playlist globale">
+            <input id="new-desc" type="text" placeholder="Description (optionnel)">
+            <label class="check-line"><input type="checkbox" id="new-public"> Playlist publique</label>
+          </div>
+          <label class="radio-line"><input type="radio" name="spotify-target-mode" value="existing"> Utiliser une playlist existante</label>
+          <div id="existing-fields" class="field-group hidden">
+            <select id="target-select"></select>
+            <p class="muted small">Seules vos playlists (ou collaborations) modifiables apparaissent ici.</p>
+          </div>
+        </div>
+
+        <div id="provider-apple" class="hidden">
+          <p class="muted small">Le transfert recrée la sélection dans Apple Music.
+          Chaque morceau est d'abord recherché par ISRC, puis par titre et artiste.</p>
+
+          <div id="apple-target" class="hidden">
+            <label class="radio-line"><input type="radio" name="apple-target-mode" value="new" checked> Créer une nouvelle playlist</label>
+            <div id="apple-new-fields" class="field-group">
+              <input id="apple-new-name" type="text" placeholder="Nom de la playlist" value="Ma playlist Apple Music">
+              <input id="apple-new-desc" type="text" placeholder="Description (optionnel)">
+              <label class="check-line"><input type="checkbox" id="apple-new-public"> Playlist publique (si disponible)</label>
+            </div>
+            <label class="radio-line"><input type="radio" name="apple-target-mode" value="existing"> Utiliser une playlist Apple Music existante</label>
+            <div id="apple-existing-fields" class="field-group hidden">
+              <select id="apple-target-select"></select>
+              <p class="muted small">Vos playlists de la bibliothèque Apple Music.</p>
+            </div>
+            <p class="muted small">Les morceaux introuvables sont ignorés et listés dans le résultat.
+            Le mode simulation permet de tout vérifier avant de créer la playlist.</p>
+          </div>
+        </div>
+
+        <div id="provider-deezer" class="hidden">
+          <p class="muted small">Deezer utilise OAuth : créez une application sur le
+          <a href="https://developers.deezer.com/" target="_blank" rel="noopener">portail développeur Deezer</a>,
+          puis autorisez votre compte. Chaque morceau est recherché par ISRC, puis par titre et artiste.</p>
+
+          <div id="deezer-target" class="hidden">
+            <label class="radio-line"><input type="radio" name="deezer-target-mode" value="new" checked> Créer une nouvelle playlist</label>
+            <div id="deezer-new-fields" class="field-group">
+              <input id="deezer-new-name" type="text" placeholder="Nom de la playlist" value="Ma playlist Deezer">
+              <input id="deezer-new-desc" type="text" placeholder="Description (optionnel)">
+            </div>
+            <label class="radio-line"><input type="radio" name="deezer-target-mode" value="existing"> Utiliser une playlist Deezer existante</label>
+            <div id="deezer-existing-fields" class="field-group hidden">
+              <select id="deezer-target-select"></select>
+              <p class="muted small">Vos playlists Deezer modifiables.</p>
+            </div>
+            <p class="muted small">Les morceaux introuvables sont ignorés et listés dans le résultat.</p>
+          </div>
+        </div>
+
+        <div id="provider-youtube" class="hidden">
+          <p class="muted small">YouTube Music n'a pas d'API officielle de gestion des playlists :
+          l'application utilise <code>ytmusicapi</code> avec une autorisation Google OAuth.
+          Cette intégration non officielle peut cesser de fonctionner si Google modifie son service.
+          Les morceaux sont retrouvés par titre, artiste et durée.</p>
 
           <div id="youtube-target" class="hidden">
             <label class="radio-line"><input type="radio" name="youtube-target-mode" value="new" checked> Créer une nouvelle playlist</label>

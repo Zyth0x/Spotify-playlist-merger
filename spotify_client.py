@@ -251,3 +251,23 @@ class SpotifyClient:
             if item and item.get("uri"):
                 uris.add(item["uri"])
         return uris
+
+    def search_track_by_isrc(self, isrc):
+        data = self.get(
+            "/search",
+            params={"q": "isrc:{}".format(isrc), "type": "track", "limit": 10},
+        )
+        tracks = (data.get("tracks") or {}).get("items") or []
+        wanted = str(isrc).upper()
+        for track in tracks:
+            candidate = ((track.get("external_ids") or {}).get("isrc") or "").upper()
+            if candidate == wanted:
+                return track
+        return tracks[0] if tracks else None
+
+    def search_tracks(self, term, limit=10):
+        data = self.get(
+            "/search",
+            params={"q": term, "type": "track", "limit": limit},
+        )
+        return (data.get("tracks") or {}).get("items") or []
