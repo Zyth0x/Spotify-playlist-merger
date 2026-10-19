@@ -147,6 +147,96 @@ input[type="text"]:focus, select:focus { border-color: var(--accent); }
 
 .field-group { margin: 6px 0 14px; display: flex; flex-direction: column; gap: 8px; }
 
+.provider-switch {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: 4px 0 16px;
+}
+
+.provider-option {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  cursor: pointer;
+  user-select: none;
+  background: var(--panel-2);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.provider-option input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.provider-option:has(input:checked) {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.provider-option:has(input:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.provider-name { font-weight: 700; font-size: 14px; }
+.provider-sub { font-size: 12px; color: var(--muted); }
+
+.provider-box {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+  margin: 12px 0;
+}
+
+.provider-box .row { flex-wrap: wrap; }
+.provider-box .row .btn { flex: 0 0 auto; }
+
+.setup-details { margin-top: 10px; }
+.setup-details summary { cursor: pointer; font-size: 14px; font-weight: 600; }
+
+.apple-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.apple-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.apple-form input[type="file"] { font-size: 12px; color: var(--muted); }
+
+.apple-form textarea {
+  width: 100%;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  padding: 10px 12px;
+  resize: vertical;
+  outline: none;
+}
+
+.apple-form textarea:focus { border-color: var(--accent); }
+
+.row.two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 0; }
+
+@media (max-width: 560px) {
+  .row.two, .provider-switch { grid-template-columns: 1fr; }
+}
+
 .change-id { margin-top: 24px; text-align: left; }
 .change-id summary { color: var(--muted); cursor: pointer; font-size: 13px; }
 
@@ -236,7 +326,7 @@ input[type="text"]:focus, select:focus { border-color: var(--accent); }
 .stat .value { font-size: 22px; font-weight: 700; }
 .stat .label { font-size: 12px; color: var(--muted); margin-top: 2px; }
 
-#dup-list { max-height: 240px; overflow-y: auto; font-size: 13px; color: var(--muted); line-height: 1.7; }
+#dup-list, #unmatched-list { max-height: 240px; overflow-y: auto; font-size: 13px; color: var(--muted); line-height: 1.7; }
 
 #result-card .btn { margin-top: 10px; margin-right: 10px; }
 

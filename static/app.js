@@ -3,6 +3,23 @@ const state = {
   selected: new Set(),
   jobId: null,
   jobTimer: null,
+  me: null,
+  apple: {
+    configured: false,
+    authenticated: false,
+    storefront: "fr",
+    team_id: null,
+    key_id: null,
+    playlists: [],
+    playlistsLoaded: false,
+    playlistsLoading: false,
+  },
+  showAppleSetup: false,
+  appleMusic: {
+    scriptPromise: null,
+    ready: null,
+    instance: null,
+  },
 };
 
 const el = (id) => document.getElementById(id);
@@ -68,9 +85,13 @@ async function boot() {
       return;
     }
     state.me = data.me;
+    if (data.apple) Object.assign(state.apple, data.apple);
     renderUser(data.me);
     showView("merger");
     renderTargetOptions();
+    renderAppleSection();
+    syncTargetFields("spotify");
+    syncTargetFields("apple");
     loadPlaylists();
   } catch (err) {
     banner(err.message, "error");
@@ -211,15 +232,249 @@ function renderTargetOptions() {
   }
 }
 
-function currentTargetMode() {
-  return document.querySelector('input[name="target-mode"]:checked').value;
+function currentProvider() {
+  return document.querySelector('input[name="target-provider"]:checked').value;
 }
 
-function syncTargetFields() {
-  const mode = currentTargetMode();
-  el("new-fields").classList.toggle("hidden", mode !== "new");
-  el("existing-fields").classList.toggle("hidden", mode !== "existing");
+function currentTargetMode(prefix) {
+  return document.querySelector(`input[name="${prefix}-target-mode"]:checked`).value;
 }
+
+function syncProviderFields() {
+  const provider = currentProvider();
+  el("provider-spotify").classList.toggle("hidden", provider !== "spotify");
+  el("provider-apple").classList.toggle("hidden", provider !== "apple_music");
+  if (provider === "apple_music") {
+    renderAppleSection();
+    if (state.apple.configured) {
+      prepareAppleMusic().catch(() => {
+        /* l'erreur sera affichée au moment de la connexion */
+      });
+    }
+  }
+}
+
+function syncTargetFields(prefix) {
+  const mode = currentTargetMode(prefix);
+  if (prefix === "spotify") {
+    el("new-fields").classList.toggle("hidden", mode !== "new");
+    el("existing-fields").classList.toggle("hidden", mode !== "existing");
+  } else {
+    el("apple-new-fields").classList.toggle("hidden", mode !== "new");
+    el("apple-existing-fields").classList.toggle("hidden", mode !== "existing");
+  }
+}
+
+// ------------------------------------------------------------- Apple Music
+
+function loadMusicKitScript() {
+  if (window.MusicKit) return Promise.resolve();
+  if (state.appleMusic.scriptPromise) return state.appleMusic.scriptPromise;
+  state.appleMusic.scriptPromise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "https://js-cdn.music.apple.com/musickit/v3/musickit.js";
+    script.async = true;
+    script.onload = () => {
+      if (window.MusicKit) resolve();
+      else document.addEventListener("musickitloaded", () => resolve(), { once: true });
+    };
+    script.onerror = () => reject(new Error("Impossible de charger MusicKit. Vérifiez votre connexion."));
+    document.head.appendChild(script);
+  });
+  return state.appleMusic.scriptPromise;
+}
+
+async function prepareAppleMusic() {
+  if (state.appleMusic.instance) return state.appleMusic.instance;
+  if (state.appleMusic.ready) return state.appleMusic.ready;
+  state.appleMusic.ready = (async () => {
+    const data = await api("/api/apple/developer-token");
+    await loadMusicKitScript();
+    const configured = await MusicKit.configure({
+      developerToken: data.developer_token,
+      storefrontId: data.storefront || "fr",
+      app: { name: "Spotify Playlist Merger", build: "1.0" },
+    });
+    const instance = configured && typeof configured.authorize === "function"
+      ? configured
+      : MusicKit.getInstance();
+    state.appleMusic.instance = instance;
+    return instance;
+  })().catch((err) => {
+    state.appleMusic.ready = null;
+    throw err;
+  });
+  return state.appleMusic.ready;
+}
+
+function renderAppleSection() {
+  const apple = state.apple;
+  const setupVisible = !apple.configured || state.showAppleSetup;
+  el("apple-setup").classList.toggle("hidden", !setupVisible);
+  el("apple-setup-details").open = setupVisible;
+  el("apple-connect").classList.toggle("hidden", !apple.configured || apple.authenticated);
+  el("apple-connected").classList.toggle("hidden", !apple.authenticated);
+  el("apple-target").classList.toggle("hidden", !apple.authenticated);
+
+  if (apple.team_id) el("apple-team-id").value = apple.team_id;
+  if (apple.key_id) el("apple-key-id").value = apple.key_id;
+  if (apple.storefront) {
+    el("apple-storefront").value = apple.storefront;
+    el("apple-storefront-label").textContent = "(storefront " + apple.storefront.toUpperCase() + ")";
+  }
+
+  if (
+    apple.authenticated &&
+    currentProvider() === "apple_music" &&
+    !apple.playlistsLoaded &&
+    !apple.playlistsLoading
+  ) {
+    loadApplePlaylists();
+  }
+}
+
+async function saveAppleConfig(event) {
+  event.preventDefault();
+  const privateKey = el("apple-key-input").value.trim();
+  const payload = {
+    team_id: el("apple-team-id").value.trim(),
+    key_id: el("apple-key-id").value.trim(),
+    storefront: el("apple-storefront").value.trim().toLowerCase() || "fr",
+    private_key: privateKey,
+  };
+  if (!payload.team_id || !payload.key_id) {
+    banner("Renseignez le Team ID et le Key ID.", "error");
+    return;
+  }
+  if (!state.apple.configured && !privateKey) {
+    banner("Sélectionnez ou collez votre clé privée .p8.", "error");
+    return;
+  }
+  try {
+    const data = await api("/api/apple/config", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    Object.assign(state.apple, data.apple, { playlists: [], playlistsLoaded: false });
+    state.showAppleSetup = false;
+    el("apple-key-input").value = "";
+    el("apple-key-file").value = "";
+    renderAppleSection();
+    banner("Configuration Apple Music enregistrée.", "ok");
+
+    if (state.appleMusic.instance) {
+      window.location.reload();
+      return;
+    }
+    if (state.apple.configured) {
+      prepareAppleMusic().catch(() => {
+        /* l'erreur sera affichée au moment de la connexion */
+      });
+    }
+  } catch (err) {
+    banner(err.message, "error");
+  }
+}
+
+function openAppleSetup() {
+  state.showAppleSetup = true;
+  renderAppleSection();
+}
+
+async function connectAppleMusic() {
+  const button = el("apple-connect-btn");
+  button.disabled = true;
+  let music = null;
+  try {
+    music = await prepareAppleMusic();
+    const token = await music.authorize();
+    if (!token) throw new Error("Apple Music n'a pas renvoyé de jeton utilisateur.");
+    const data = await api("/api/apple/session", {
+      method: "POST",
+      body: JSON.stringify({ music_user_token: token }),
+    });
+    Object.assign(state.apple, data.apple, { playlists: [], playlistsLoaded: false });
+    state.showAppleSetup = false;
+    renderAppleSection();
+    banner("Connexion à Apple Music réussie.", "ok");
+  } catch (err) {
+    const message = err && err.message ? err.message : "Connexion à Apple Music impossible.";
+    if (music && /session|reconnect|invalide/i.test(message)) {
+      try {
+        await music.unauthorize();
+      } catch (unauthorizeError) {
+        /* la prochaine tentative redemandera l'autorisation */
+      }
+    }
+    banner(message, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function disconnectAppleMusic() {
+  try {
+    if (state.appleMusic.instance && typeof state.appleMusic.instance.unauthorize === "function") {
+      await state.appleMusic.instance.unauthorize();
+    }
+  } catch (err) {
+    /* le jeton local est supprimé quoi qu'il arrive */
+  }
+  try {
+    await api("/api/apple/logout", { method: "POST" });
+    state.apple.authenticated = false;
+    state.apple.playlists = [];
+    state.apple.playlistsLoaded = false;
+    renderAppleSection();
+    banner("Compte Apple Music déconnecté.", "");
+  } catch (err) {
+    banner(err.message, "error");
+  }
+}
+
+async function loadApplePlaylists() {
+  if (!state.apple.authenticated || state.apple.playlistsLoading) return;
+  state.apple.playlistsLoading = true;
+  const select = el("apple-target-select");
+  select.innerHTML = '<option value="">Chargement…</option>';
+  try {
+    const data = await api("/api/apple/playlists");
+    state.apple.playlists = data.playlists || [];
+    state.apple.playlistsLoaded = true;
+    renderAppleTargetOptions();
+  } catch (err) {
+    select.innerHTML = '<option value="">Erreur de chargement</option>';
+    banner(err.message, "error");
+    if (/session|reconnect|non connecté/i.test(err.message)) {
+      state.apple.authenticated = false;
+      state.apple.playlistsLoaded = false;
+      renderAppleSection();
+    }
+  } finally {
+    state.apple.playlistsLoading = false;
+  }
+}
+
+function renderAppleTargetOptions() {
+  const select = el("apple-target-select");
+  const options = (state.apple.playlists || []).filter((p) => p.can_edit !== false);
+  select.innerHTML = "";
+  if (!options.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "Aucune playlist Apple Music modifiable";
+    select.appendChild(option);
+    return;
+  }
+  for (const playlist of options) {
+    const option = document.createElement("option");
+    option.value = playlist.id;
+    option.textContent = playlist.name;
+    select.appendChild(option);
+  }
+}
+
+// ------------------------------------------------------------------- merge
 
 async function startMerge() {
   const errorNode = el("start-error");
@@ -230,28 +485,69 @@ async function startMerge() {
     errorNode.classList.remove("hidden");
     return;
   }
-  const mode = currentTargetMode();
+
+  const provider = currentProvider();
   let target;
-  if (mode === "new") {
-    target = {
-      mode: "new",
-      name: el("new-name").value.trim(),
-      description: el("new-desc").value.trim(),
-      public: el("new-public").checked,
-    };
-    if (!target.name) {
-      errorNode.textContent = "Indiquez un nom pour la nouvelle playlist.";
+  if (provider === "apple_music") {
+    if (!state.apple.configured) {
+      errorNode.textContent = "Configurez d'abord Apple Music.";
       errorNode.classList.remove("hidden");
       return;
+    }
+    if (!state.apple.authenticated) {
+      errorNode.textContent = "Connectez votre compte Apple Music avant de lancer le transfert.";
+      errorNode.classList.remove("hidden");
+      return;
+    }
+    const mode = currentTargetMode("apple");
+    if (mode === "new") {
+      target = {
+        provider,
+        mode,
+        name: el("apple-new-name").value.trim(),
+        description: el("apple-new-desc").value.trim(),
+        public: el("apple-new-public").checked,
+      };
+      if (!target.name) {
+        errorNode.textContent = "Indiquez un nom pour la nouvelle playlist Apple Music.";
+        errorNode.classList.remove("hidden");
+        return;
+      }
+    } else {
+      const id = el("apple-target-select").value;
+      if (!id) {
+        errorNode.textContent = "Choisissez une playlist Apple Music existante.";
+        errorNode.classList.remove("hidden");
+        return;
+      }
+      const playlist = (state.apple.playlists || []).find((p) => p.id === id);
+      target = { provider, mode, id, name: playlist ? playlist.name : "" };
     }
   } else {
-    target = { mode: "existing", id: el("target-select").value };
-    if (!target.id) {
-      errorNode.textContent = "Choisissez une playlist existante.";
-      errorNode.classList.remove("hidden");
-      return;
+    const mode = currentTargetMode("spotify");
+    if (mode === "new") {
+      target = {
+        provider,
+        mode,
+        name: el("new-name").value.trim(),
+        description: el("new-desc").value.trim(),
+        public: el("new-public").checked,
+      };
+      if (!target.name) {
+        errorNode.textContent = "Indiquez un nom pour la nouvelle playlist.";
+        errorNode.classList.remove("hidden");
+        return;
+      }
+    } else {
+      target = { provider, mode, id: el("target-select").value };
+      if (!target.id) {
+        errorNode.textContent = "Choisissez une playlist existante.";
+        errorNode.classList.remove("hidden");
+        return;
+      }
     }
   }
+
   const options = {
     dedupe: el("opt-dedupe").checked,
     dedupe_isrc: el("opt-isrc").checked,
@@ -260,6 +556,7 @@ async function startMerge() {
 
   el("start-btn").disabled = true;
   el("result-card").classList.add("hidden");
+  el("progress-title").textContent = provider === "apple_music" ? "Transfert en cours…" : "Fusion en cours…";
   try {
     const data = await api("/api/merge", {
       method: "POST",
@@ -296,6 +593,7 @@ async function pollJob() {
 const phaseLabels = {
   collect: "Lecture des playlists",
   target: "Préparation de la destination",
+  match: "Recherche sur Apple Music",
   add: "Ajout des morceaux",
 };
 
@@ -315,7 +613,7 @@ function finishJob(job) {
   el("start-btn").disabled = false;
 
   if (job.status === "error") {
-    banner(job.error || "Erreur pendant la fusion.", "error");
+    banner(job.error || "Erreur pendant l'opération.", "error");
     return;
   }
   renderResult(job);
@@ -325,25 +623,37 @@ function renderResult(job) {
   const result = job.result || {};
   const stats = result.stats || {};
   const cancelled = job.status === "cancelled";
+  const isApple = result.provider === "apple_music";
 
-  el("result-title").textContent = result.dry_run ? "Simulation terminée" : "Fusion terminée";
+  el("result-title").textContent = result.dry_run
+    ? "Simulation terminée"
+    : isApple
+      ? "Transfert terminé"
+      : "Fusion terminée";
+
   let sub = "";
-  if (cancelled) sub = "Fusion annulée. ";
+  if (cancelled) sub = "Opération annulée. ";
+  const destination = isApple ? " sur Apple Music" : "";
   if (result.dry_run) {
-    sub += `${result.to_add} morceau(x) unique(s) seraient ajoutés à « ${result.playlist_name} ». Aucune modification n'a été effectuée.`;
+    sub += `${result.to_add} morceau(x) unique(s) seraient ajoutés à « ${result.playlist_name} »${destination}. Aucune modification n'a été effectuée.`;
   } else if (result.added != null) {
-    sub += `${result.added} morceau(x) ajouté(s) à « ${result.playlist_name} ».`;
+    sub += `${result.added} morceau(x) ajouté(s) à « ${result.playlist_name} »${destination}.`;
   }
   el("result-sub").textContent = sub;
 
-  const rows = [
-    ["Morceaux uniques retenus", result.to_add],
-    ["Doublons ignorés (entre playlists)", stats.duplicates],
-    ["Déjà dans la playlist cible", stats.already_in_target],
-    ["Épisodes ignorés", stats.episodes],
-    ["Fichiers locaux ignorés", stats.local_files],
-    ["Morceaux indisponibles", stats.unavailable],
-  ];
+  const rows = [[isApple ? "Morceaux à ajouter" : "Morceaux uniques retenus", result.to_add]];
+  if (isApple) {
+    rows.push(["Correspondances exactes (ISRC)", stats.matched_isrc]);
+    rows.push(["Correspondances par recherche", stats.matched_search]);
+    rows.push(["Introuvables sur Apple Music", stats.unmatched]);
+    rows.push(["Doublons ignorés (entre sources)", stats.duplicates]);
+  } else {
+    rows.push(["Doublons ignorés (entre playlists)", stats.duplicates]);
+  }
+  rows.push(["Déjà dans la playlist cible", stats.already_in_target]);
+  rows.push(["Épisodes ignorés", stats.episodes]);
+  rows.push(["Fichiers locaux ignorés", stats.local_files]);
+  rows.push(["Morceaux indisponibles", stats.unavailable]);
   if (!result.dry_run) rows.push(["Morceaux ajoutés", result.added]);
 
   el("result-stats").innerHTML = rows
@@ -356,6 +666,9 @@ function renderResult(job) {
   const linkWrap = el("result-link-wrap");
   if (result.playlist_url && !result.dry_run) {
     el("result-link").href = result.playlist_url;
+    el("result-link").textContent = isApple
+      ? "Ouvrir la playlist dans Apple Music"
+      : "Ouvrir la playlist dans Spotify";
     linkWrap.classList.remove("hidden");
   } else {
     linkWrap.classList.add("hidden");
@@ -368,6 +681,17 @@ function renderResult(job) {
     dupDetails.classList.remove("hidden");
   } else {
     dupDetails.classList.add("hidden");
+  }
+
+  const unmatchedDetails = el("unmatched-details");
+  const unmatchedPreview = result.unmatched_preview || [];
+  if (unmatchedPreview.length) {
+    el("unmatched-list").innerHTML = unmatchedPreview
+      .map((label) => `<li>${escapeHtml(label)}</li>`)
+      .join("");
+    unmatchedDetails.classList.remove("hidden");
+  } else {
+    unmatchedDetails.classList.add("hidden");
   }
 
   const skipped = stats.skipped_playlists || [];
@@ -438,13 +762,38 @@ el("select-all").addEventListener("change", (event) => {
   renderPlaylists();
 });
 
-document.querySelectorAll('input[name="target-mode"]').forEach((radio) => {
-  radio.addEventListener("change", syncTargetFields);
+document.querySelectorAll('input[name="target-provider"]').forEach((radio) => {
+  radio.addEventListener("change", syncProviderFields);
 });
+
+document.querySelectorAll('input[name="spotify-target-mode"]').forEach((radio) => {
+  radio.addEventListener("change", () => syncTargetFields("spotify"));
+});
+
+document.querySelectorAll('input[name="apple-target-mode"]').forEach((radio) => {
+  radio.addEventListener("change", () => syncTargetFields("apple"));
+});
+
+el("apple-config-form").addEventListener("submit", saveAppleConfig);
+el("apple-key-file").addEventListener("change", async (event) => {
+  const file = event.target.files && event.target.files[0];
+  if (!file) return;
+  try {
+    el("apple-key-input").value = await file.text();
+  } catch (err) {
+    banner("Impossible de lire le fichier de clé.", "error");
+  }
+});
+el("apple-connect-btn").addEventListener("click", connectAppleMusic);
+el("apple-disconnect-btn").addEventListener("click", disconnectAppleMusic);
+el("apple-reconfigure-btn").addEventListener("click", openAppleSetup);
+el("apple-reconfigure-btn-2").addEventListener("click", openAppleSetup);
 
 el("start-btn").addEventListener("click", startMerge);
 el("cancel-btn").addEventListener("click", cancelJob);
 el("new-merge-btn").addEventListener("click", resetMerge);
 
-syncTargetFields();
+syncTargetFields("spotify");
+syncTargetFields("apple");
+renderAppleSection();
 boot();

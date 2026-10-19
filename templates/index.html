@@ -24,8 +24,9 @@
   <section id="view-setup" class="view hidden">
     <div class="card wide">
       <h1>Configuration</h1>
-      <p class="muted">Cette application locale fusionne vos playlists Spotify. Elle utilise OAuth 2.0 avec PKCE :
-      aucun mot de passe Spotify ne transite par cette application, et son code n'a besoin d'aucun secret.</p>
+      <p class="muted">Cette application locale fusionne vos playlists Spotify et peut les transférer vers Apple Music.
+      Elle utilise OAuth 2.0 avec PKCE : aucun mot de passe Spotify ne transite par cette application, et son code
+      n'a besoin d'aucun secret.</p>
       <ol class="steps">
         <li>Ouvrez le <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener">Spotify Developer Dashboard</a> et connectez-vous.
         Spotify exige un compte <strong>Premium</strong> pour les applications en mode développement.</li>
@@ -62,7 +63,7 @@
   <section id="view-merger" class="view hidden">
     <div class="layout">
       <div class="card playlists-card">
-        <h2>1 · Playlists à fusionner</h2>
+        <h2>1 · Playlists Spotify à fusionner / transférer</h2>
         <div class="toolbar">
           <input id="filter" type="text" placeholder="Filtrer par nom…" autocomplete="off">
           <label class="check-line"><input type="checkbox" id="select-all"> Tout sélectionner</label>
@@ -74,23 +75,106 @@
       </div>
 
       <div class="card config-card">
-        <h2>2 · Playlist de destination</h2>
-        <label class="radio-line"><input type="radio" name="target-mode" value="new" checked> Créer une nouvelle playlist</label>
-        <div id="new-fields" class="field-group">
-          <input id="new-name" type="text" placeholder="Nom de la playlist" value="Ma playlist globale">
-          <input id="new-desc" type="text" placeholder="Description (optionnel)">
-          <label class="check-line"><input type="checkbox" id="new-public"> Playlist publique</label>
+        <h2>2 · Destination</h2>
+        <div class="provider-switch">
+          <label class="provider-option">
+            <input type="radio" name="target-provider" value="spotify" checked>
+            <span class="provider-name">Spotify</span>
+            <span class="provider-sub">Fusionner dans Spotify</span>
+          </label>
+          <label class="provider-option">
+            <input type="radio" name="target-provider" value="apple_music">
+            <span class="provider-name">Apple Music</span>
+            <span class="provider-sub">Transférer vers Apple Music</span>
+          </label>
         </div>
-        <label class="radio-line"><input type="radio" name="target-mode" value="existing"> Utiliser une playlist existante</label>
-        <div id="existing-fields" class="field-group hidden">
-          <select id="target-select"></select>
-          <p class="muted small">Seules vos playlists (ou collaborations) modifiables apparaissent ici.</p>
+
+        <div id="provider-spotify">
+          <label class="radio-line"><input type="radio" name="spotify-target-mode" value="new" checked> Créer une nouvelle playlist</label>
+          <div id="new-fields" class="field-group">
+            <input id="new-name" type="text" placeholder="Nom de la playlist" value="Ma playlist globale">
+            <input id="new-desc" type="text" placeholder="Description (optionnel)">
+            <label class="check-line"><input type="checkbox" id="new-public"> Playlist publique</label>
+          </div>
+          <label class="radio-line"><input type="radio" name="spotify-target-mode" value="existing"> Utiliser une playlist existante</label>
+          <div id="existing-fields" class="field-group hidden">
+            <select id="target-select"></select>
+            <p class="muted small">Seules vos playlists (ou collaborations) modifiables apparaissent ici.</p>
+          </div>
+        </div>
+
+        <div id="provider-apple" class="hidden">
+          <p class="muted small">Le transfert lit vos playlists Spotify puis recrée la sélection dans Apple Music.
+          Chaque morceau est d'abord recherché par ISRC, puis par titre et artiste.</p>
+
+          <div id="apple-setup" class="provider-box hidden">
+            <p class="muted small">Apple Music nécessite un compte <strong>Apple Developer Program</strong> (MusicKit),
+            une clé privée <code>.p8</code> et un abonnement Apple Music actif.</p>
+            <details id="apple-setup-details" class="setup-details">
+              <summary>Configuration MusicKit</summary>
+              <form id="apple-config-form" class="apple-form">
+                <div class="row two">
+                  <label>Team ID
+                    <input id="apple-team-id" type="text" placeholder="ABCDE12345" maxlength="10" autocomplete="off" spellcheck="false">
+                  </label>
+                  <label>Key ID
+                    <input id="apple-key-id" type="text" placeholder="ABCDE12345" maxlength="10" autocomplete="off" spellcheck="false">
+                  </label>
+                </div>
+                <div class="row two">
+                  <label>Storefront
+                    <input id="apple-storefront" type="text" placeholder="fr" maxlength="2" autocomplete="off" spellcheck="false">
+                  </label>
+                </div>
+                <label>Clé privée (.p8)
+                  <input id="apple-key-file" type="file" accept=".p8,.pem,text/plain">
+                </label>
+                <textarea id="apple-key-input" rows="4" placeholder="-----BEGIN PRIVATE KEY-----&#10;…&#10;-----END PRIVATE KEY-----" spellcheck="false"></textarea>
+                <button class="btn" type="submit">Enregistrer la configuration</button>
+                <p class="muted small">La clé est stockée uniquement en local dans <code>data/apple_key.p8</code>
+                avec des permissions restreintes (<code>0600</code>).</p>
+              </form>
+            </details>
+          </div>
+
+          <div id="apple-connect" class="provider-box hidden">
+            <p class="muted small">Configuration enregistrée. Connectez votre compte Apple Music pour autoriser
+            la lecture de votre bibliothèque et la création de playlists.</p>
+            <div class="row">
+              <button id="apple-connect-btn" class="btn" type="button">Se connecter à Apple Music</button>
+              <button id="apple-reconfigure-btn" class="btn ghost" type="button">Reconfigurer</button>
+            </div>
+          </div>
+
+          <div id="apple-connected" class="provider-box hidden">
+            <p class="muted small">Connecté à Apple Music <span id="apple-storefront-label"></span>.</p>
+            <div class="row">
+              <button id="apple-disconnect-btn" class="btn ghost small" type="button">Déconnecter Apple Music</button>
+              <button id="apple-reconfigure-btn-2" class="btn ghost small" type="button">Reconfigurer</button>
+            </div>
+          </div>
+
+          <div id="apple-target" class="hidden">
+            <label class="radio-line"><input type="radio" name="apple-target-mode" value="new" checked> Créer une nouvelle playlist</label>
+            <div id="apple-new-fields" class="field-group">
+              <input id="apple-new-name" type="text" placeholder="Nom de la playlist" value="Ma playlist Apple Music">
+              <input id="apple-new-desc" type="text" placeholder="Description (optionnel)">
+              <label class="check-line"><input type="checkbox" id="apple-new-public"> Playlist publique (si disponible)</label>
+            </div>
+            <label class="radio-line"><input type="radio" name="apple-target-mode" value="existing"> Utiliser une playlist Apple Music existante</label>
+            <div id="apple-existing-fields" class="field-group hidden">
+              <select id="apple-target-select"></select>
+              <p class="muted small">Vos playlists de la bibliothèque Apple Music.</p>
+            </div>
+            <p class="muted small">Les morceaux introuvables sont ignorés et listés dans le résultat.
+            Le mode simulation permet de tout vérifier avant de créer la playlist.</p>
+          </div>
         </div>
 
         <h2>3 · Doublons</h2>
         <label class="check-line"><input type="checkbox" id="opt-dedupe" checked> Retirer les doublons</label>
         <label class="check-line indent"><input type="checkbox" id="opt-isrc"> Détecter aussi les mêmes morceaux (même ISRC, versions différentes)</label>
-        <label class="check-line"><input type="checkbox" id="opt-dry"> Simulation (ne rien modifier dans Spotify)</label>
+        <label class="check-line"><input type="checkbox" id="opt-dry"> Simulation (ne rien modifier)</label>
 
         <button id="start-btn" class="btn big full">Lancer la fusion</button>
         <p id="start-error" class="error small hidden"></p>
@@ -98,7 +182,7 @@
     </div>
 
     <div id="progress-card" class="card hidden">
-      <h2>Fusion en cours…</h2>
+      <h2 id="progress-title">Fusion en cours…</h2>
       <p id="progress-msg" class="muted">Préparation…</p>
       <div class="bar"><div id="progress-fill" class="bar-fill"></div></div>
       <p id="progress-detail" class="muted small"></p>
@@ -109,10 +193,14 @@
       <h2 id="result-title">Résultat</h2>
       <p id="result-sub" class="muted"></p>
       <div id="result-stats" class="stats-grid"></div>
-      <p id="result-link-wrap" class="hidden"><a id="result-link" href="#" target="_blank" rel="noopener" class="btn">Ouvrir la playlist dans Spotify</a></p>
+      <p id="result-link-wrap" class="hidden"><a id="result-link" href="#" target="_blank" rel="noopener" class="btn">Ouvrir la playlist</a></p>
       <details id="dup-details" class="hidden">
         <summary>Voir les doublons ignorés</summary>
         <ul id="dup-list"></ul>
+      </details>
+      <details id="unmatched-details" class="hidden">
+        <summary>Voir les morceaux introuvables sur Apple Music</summary>
+        <ul id="unmatched-list"></ul>
       </details>
       <p id="skipped-wrap" class="muted small hidden"></p>
       <button id="new-merge-btn" class="btn ghost">Nouvelle fusion</button>

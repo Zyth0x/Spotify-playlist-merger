@@ -1,10 +1,19 @@
 import os
+import re
 import secrets
 import threading
 import uuid
 
 from flask import Flask, jsonify, redirect, render_template, request, session
 
+from apple_client import (
+    AppleMusicAPIError,
+    AppleMusicAuthError,
+    AppleMusicClient,
+    AppleMusicConfigError,
+    validate_private_key,
+)
+from matching import pick_best_candidate
 from spotify_client import (
     SpotifyAPIError,
     SpotifyAuthError,
@@ -19,14 +28,21 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 TOKENS_PATH = os.path.join(DATA_DIR, "tokens.json")
+APPLE_KEY_PATH = os.path.join(DATA_DIR, "apple_key.p8")
+APPLE_TOKENS_PATH = os.path.join(DATA_DIR, "apple_tokens.json")
 
 HOST = "127.0.0.1"
 PORT = 8888
-REDIRECT_URI = "http://{}:{}/callback".format(HOST, PORT)
+ORIGIN = "http://{}:{}".format(HOST, PORT)
+APPLE_ORIGINS = [ORIGIN, "http://localhost:{}".format(PORT)]
+REDIRECT_URI = ORIGIN + "/callback"
 
 BATCH_SIZE = 100
+APPLE_BATCH_SIZE = 100
 MAX_PLAYLIST_ITEMS = 10000
 DUP_PREVIEW_LIMIT = 50
+
+TARGET_PROVIDERS = ("spotify", "apple_music")
 
 
 class MergeError(Exception):
@@ -46,11 +62,21 @@ def load_config():
     return load_json_file(CONFIG_PATH) or {}
 
 
+def update_config(updates):
+    config = load_config()
+    config.update(updates)
+    save_json_file(CONFIG_PATH, config)
+
+
 def get_client():
     client_id = load_config().get("client_id")
     if not client_id:
         raise SpotifyAuthError("Client ID manquant. Configurez d'abord votre application Spotify.")
     return SpotifyClient(client_id, TOKENS_PATH)
+
+
+def get_apple_client():
+    return AppleMusicClient(load_config(), APPLE_KEY_PATH, APPLE_TOKENS_PATH, APPLE_ORIGINS)
 
 
 def track_label(item):
@@ -62,6 +88,28 @@ def track_label(item):
 def chunks(seq, size):
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
+
+
+def apple_public_state(client):
+    return {
+        "configured": client.is_configured(),
+        "authenticated": client.is_authenticated(),
+        "storefront": client.storefront,
+        "team_id": client.team_id or None,
+        "key_id": client.key_id or None,
+    }
+
+
+def apple_artwork(attributes):
+    artwork = attributes.get("artwork") or {}
+    url = artwork.get("url")
+    if not url:
+        return None
+    return url.replace("{w}x{h}", "60x60")
+
+
+def apple_playlist_url(playlist_id):
+    return "https://music.apple.com/library/playlist/{}".format(playlist_id)
 
 
 @app.route("/")
@@ -92,7 +140,22 @@ def api_state():
             except SpotifyAPIError as exc:
                 if exc.status in (401, 403):
                     authenticated = False
-    return jsonify({"has_client_id": bool(client_id), "authenticated": authenticated, "me": me})
+
+    apple = apple_public_state(get_apple_client())
+    return jsonify({
+        "has_client_id": bool(client_id),
+        "authenticated": authenticated,
+        "me": me,
+        "apple": apple,
+        "providers": {
+            "spotify": {
+                "configured": bool(client_id),
+                "authenticated": authenticated,
+                "me": me,
+            },
+            "apple_music": apple,
+        },
+    })
 
 
 @app.route("/api/client-id", methods=["POST"])
@@ -101,7 +164,7 @@ def api_client_id():
     client_id = (data.get("client_id") or "").strip()
     if not client_id or len(client_id) > 64 or " " in client_id:
         return jsonify({"error": "Client ID invalide."}), 400
-    save_json_file(CONFIG_PATH, {"client_id": client_id})
+    update_config({"client_id": client_id})
     return jsonify({"ok": True})
 
 
@@ -181,6 +244,156 @@ def api_playlists():
     return jsonify({"playlists": playlists})
 
 
+# ---------------------------------------------------------------- Apple Music
+
+
+@app.route("/api/apple/config", methods=["POST"])
+def api_apple_config():
+    data = request.get_json(silent=True) or {}
+    team_id = str(data.get("team_id") or "").strip().upper()
+    key_id = str(data.get("key_id") or "").strip().upper()
+    storefront = str(data.get("storefront") or "fr").strip().lower()
+    private_key = str(data.get("private_key") or "")
+
+    if not re.fullmatch(r"[A-Z0-9]{10}", team_id):
+        return jsonify({"error": "Team ID Apple invalide (10 caractères alphanumériques)."}), 400
+    if not re.fullmatch(r"[A-Z0-9]{10}", key_id):
+        return jsonify({"error": "Key ID Apple invalide (10 caractères alphanumériques)."}), 400
+    if not re.fullmatch(r"[a-z]{2}", storefront):
+        return jsonify({"error": "Storefront invalide (deux lettres, par exemple « fr »)."}), 400
+
+    if private_key:
+        private_key = private_key.replace("\\n", "\n").strip()
+        if not private_key.endswith("\n"):
+            private_key += "\n"
+        error = validate_private_key(private_key)
+        if error:
+            return jsonify({"error": error}), 400
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            tmp_path = APPLE_KEY_PATH + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                handle.write(private_key)
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, APPLE_KEY_PATH)
+        except OSError as exc:
+            return jsonify({"error": "Impossible d'enregistrer la clé privée : {}".format(exc)}), 500
+    elif not os.path.exists(APPLE_KEY_PATH):
+        return jsonify({"error": "Collez le contenu de votre clé privée .p8."}), 400
+
+    previous = load_config().get("apple_music") or {}
+    update_config({
+        "apple_music": {
+            "team_id": team_id,
+            "key_id": key_id,
+            "storefront": storefront,
+        }
+    })
+
+    # Le jeton utilisateur est lié à l'application MusicKit : on l'oublie si
+    # l'identité ou la clé change.
+    identity_changed = (
+        private_key
+        or previous.get("team_id") != team_id
+        or previous.get("key_id") != key_id
+    )
+    if identity_changed:
+        try:
+            os.remove(APPLE_TOKENS_PATH)
+        except OSError:
+            pass
+
+    client = get_apple_client()
+    try:
+        client.developer_token()
+    except AppleMusicConfigError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"ok": True, "apple": apple_public_state(client)})
+
+
+@app.route("/api/apple/developer-token")
+def api_apple_developer_token():
+    client = get_apple_client()
+    if not client.is_configured():
+        return jsonify({"error": "Apple Music n'est pas encore configuré."}), 400
+    try:
+        token = client.developer_token(for_browser=True)
+    except AppleMusicConfigError as exc:
+        return jsonify({"error": str(exc)}), 400
+    response = jsonify({
+        "developer_token": token,
+        "storefront": client.storefront,
+    })
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/api/apple/session", methods=["POST"])
+def api_apple_session():
+    data = request.get_json(silent=True) or {}
+    music_user_token = str(data.get("music_user_token") or "").strip()
+    if not music_user_token:
+        return jsonify({"error": "Jeton Apple Music manquant."}), 400
+
+    client = get_apple_client()
+    if not client.is_configured():
+        return jsonify({"error": "Apple Music n'est pas encore configuré."}), 400
+
+    client.set_user_token(music_user_token)
+    try:
+        client.me_storefront()
+    except AppleMusicAuthError as exc:
+        client.logout()
+        return jsonify({"error": str(exc)}), 401
+    except AppleMusicConfigError as exc:
+        client.logout()
+        return jsonify({"error": str(exc)}), 400
+    except AppleMusicAPIError as exc:
+        client.logout()
+        return jsonify({"error": exc.message}), 400
+
+    return jsonify({"ok": True, "apple": apple_public_state(client)})
+
+
+@app.route("/api/apple/logout", methods=["POST"])
+def api_apple_logout():
+    get_apple_client().logout()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/apple/playlists")
+def api_apple_playlists():
+    client = get_apple_client()
+    if not client.is_configured():
+        return jsonify({"error": "Apple Music n'est pas encore configuré."}), 400
+    if not client.is_authenticated():
+        return jsonify({"error": "Compte Apple Music non connecté."}), 401
+
+    try:
+        raw_playlists = client.all_playlists()
+    except AppleMusicAuthError as exc:
+        return jsonify({"error": str(exc)}), 401
+    except AppleMusicConfigError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except AppleMusicAPIError as exc:
+        return jsonify({"error": exc.message}), 502
+
+    playlists = []
+    for pl in raw_playlists:
+        attributes = pl.get("attributes") or {}
+        playlists.append({
+            "id": pl.get("id"),
+            "name": attributes.get("name") or "(sans titre)",
+            "track_count": attributes.get("trackCount"),
+            "can_edit": attributes.get("canEdit", True),
+            "image": apple_artwork(attributes),
+        })
+    return jsonify({"playlists": playlists})
+
+
+# --------------------------------------------------------------------- merge
+
+
 @app.route("/api/merge", methods=["POST"])
 def api_merge():
     data = request.get_json(silent=True) or {}
@@ -189,6 +402,10 @@ def api_merge():
         return jsonify({"error": "Sélectionnez au moins une playlist source."}), 400
 
     target = data.get("target") or {}
+    provider = target.get("provider") or "spotify"
+    if provider not in TARGET_PROVIDERS:
+        return jsonify({"error": "Fournisseur de destination inconnu."}), 400
+
     mode = target.get("mode")
     if mode not in ("new", "existing"):
         return jsonify({"error": "Destination invalide."}), 400
@@ -196,6 +413,14 @@ def api_merge():
         return jsonify({"error": "Indiquez un nom pour la nouvelle playlist."}), 400
     if mode == "existing" and not target.get("id"):
         return jsonify({"error": "Choisissez une playlist existante."}), 400
+
+    apple = None
+    if provider == "apple_music":
+        apple = get_apple_client()
+        if not apple.is_configured():
+            return jsonify({"error": "Configurez d'abord Apple Music (Team ID, Key ID et clé .p8)."}), 400
+        if not apple.is_authenticated():
+            return jsonify({"error": "Connectez votre compte Apple Music avant de lancer le transfert."}), 401
 
     raw_options = data.get("options") or {}
     options = {
@@ -223,7 +448,7 @@ def api_merge():
     if len(sources) != len(playlist_ids):
         return jsonify({"error": "Certaines playlists sélectionnées sont introuvables."}), 400
 
-    if mode == "existing":
+    if provider == "spotify" and mode == "existing":
         try:
             playlist = client.get_playlist(target["id"])
         except SpotifyAuthError as exc:
@@ -243,6 +468,7 @@ def api_merge():
         "message": "Préparation…",
         "progress": {"done": 0, "total": len(sources)},
         "added": 0,
+        "provider": provider,
         "result": None,
         "error": None,
         "cancel": False,
@@ -253,7 +479,7 @@ def api_merge():
     client_id = load_config()["client_id"]
     worker = threading.Thread(
         target=run_merge,
-        args=(job_id, client_id, sources, target, options),
+        args=(job_id, client_id, provider, sources, target, options),
         daemon=True,
     )
     worker.start()
@@ -283,11 +509,12 @@ def api_merge_cancel(job_id):
     return jsonify({"ok": True})
 
 
-def run_merge(job_id, client_id, sources, target, options):
+def run_merge(job_id, client_id, provider, sources, target, options):
     job = JOBS[job_id]
     client = SpotifyClient(client_id, TOKENS_PATH)
+    apple = get_apple_client() if provider == "apple_music" else None
     try:
-        result = perform_merge(client, job, sources, target, options)
+        result = perform_merge(client, apple, job, provider, sources, target, options)
         job["result"] = result
         job["status"] = "cancelled" if job["cancel"] else "done"
         job["message"] = "Terminé."
@@ -297,15 +524,31 @@ def run_merge(job_id, client_id, sources, target, options):
     except SpotifyAPIError as exc:
         job["status"] = "error"
         job["error"] = "Erreur Spotify ({}): {}".format(exc.status, exc.message)
+    except AppleMusicAuthError as exc:
+        job["status"] = "error"
+        job["error"] = str(exc)
+    except AppleMusicConfigError as exc:
+        job["status"] = "error"
+        job["error"] = str(exc)
+    except AppleMusicAPIError as exc:
+        job["status"] = "error"
+        job["error"] = "Erreur Apple Music ({}): {}".format(exc.status, exc.message)
     except MergeError as exc:
         job["status"] = "error"
         job["error"] = str(exc)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - remonté dans l'interface
         job["status"] = "error"
         job["error"] = "Erreur inattendue : {}".format(exc)
 
 
-def perform_merge(client, job, sources, target, options):
+def perform_merge(client, apple, job, provider, sources, target, options):
+    tracks, stats, dup_preview = collect_tracks(client, job, sources, options)
+    if provider == "apple_music":
+        return perform_apple_transfer(apple, job, tracks, target, options, stats, dup_preview)
+    return perform_spotify_merge(client, job, tracks, target, options, stats, dup_preview)
+
+
+def collect_tracks(client, job, sources, options):
     stats = {
         "tracks_read": 0,
         "duplicates": 0,
@@ -313,19 +556,24 @@ def perform_merge(client, job, sources, target, options):
         "local_files": 0,
         "unavailable": 0,
         "already_in_target": 0,
+        "matched_isrc": 0,
+        "matched_search": 0,
+        "unmatched": 0,
         "skipped_playlists": [],
     }
     dup_preview = []
     seen_uris = set()
     seen_isrc = set()
-    uris = []
+    tracks = []
 
     job["phase"] = "collect"
     job["progress"] = {"done": 0, "total": len(sources)}
     for index, source in enumerate(sources):
         if job["cancel"]:
             break
-        job["message"] = "Lecture de « {} » ({}/{})".format(source["name"], index + 1, len(sources))
+        job["message"] = "Lecture de « {} » ({}/{})".format(
+            source["name"], index + 1, len(sources)
+        )
         try:
             for entry in client.playlist_items(source["id"]):
                 item = entry.get("item") or entry.get("track")
@@ -358,7 +606,19 @@ def perform_merge(client, job, sources, target, options):
                 seen_uris.add(uri)
                 if isrc:
                     seen_isrc.add(isrc)
-                uris.append(uri)
+                tracks.append({
+                    "uri": uri,
+                    "isrc": isrc,
+                    "title": item.get("name") or "",
+                    "artists": [
+                        artist.get("name")
+                        for artist in item.get("artists") or []
+                        if artist.get("name")
+                    ],
+                    "album": (item.get("album") or {}).get("name") or "",
+                    "duration_ms": item.get("duration_ms"),
+                    "label": track_label(item),
+                })
         except SpotifyAPIError as exc:
             if exc.status in (403, 404):
                 stats["skipped_playlists"].append(source["name"])
@@ -366,6 +626,11 @@ def perform_merge(client, job, sources, target, options):
             raise
         job["progress"]["done"] = index + 1
 
+    return tracks, stats, dup_preview
+
+
+def perform_spotify_merge(client, job, tracks, target, options, stats, dup_preview):
+    uris = [track["uri"] for track in tracks]
     job["phase"] = "target"
     created = False
     target_id = None
@@ -374,6 +639,7 @@ def perform_merge(client, job, sources, target, options):
 
     if job["cancel"]:
         return {
+            "provider": "spotify",
             "created": False,
             "dry_run": options["dry_run"],
             "playlist_id": None,
@@ -428,6 +694,7 @@ def perform_merge(client, job, sources, target, options):
         target_url = "https://open.spotify.com/playlist/{}".format(target_id)
 
     result = {
+        "provider": "spotify",
         "created": created,
         "dry_run": options["dry_run"],
         "playlist_id": target_id,
@@ -452,6 +719,159 @@ def perform_merge(client, job, sources, target, options):
         job["added"] += len(batch)
         job["progress"]["done"] = job["added"]
         job["message"] = "Ajout des morceaux… {}/{}".format(job["added"], len(uris))
+    result["added"] = job["added"]
+    return result
+
+
+def resolve_apple_song(apple, track):
+    """Retourne (morceau Apple Music, méthode) ou (None, None)."""
+    isrc = (track.get("isrc") or "").strip()
+    if isrc:
+        try:
+            song = apple.search_song_by_isrc(isrc)
+            if song:
+                return song, "isrc"
+        except (AppleMusicAuthError, AppleMusicConfigError):
+            raise
+        except AppleMusicAPIError as exc:
+            if exc.status in (401, 403, 429) or exc.status >= 500:
+                raise
+
+    term = "{} {}".format(
+        track.get("title") or "",
+        (track.get("artists") or [""])[0],
+    ).strip()
+    if not term:
+        return None, None
+    candidates = apple.search_songs(term, limit=10)
+    song, _score = pick_best_candidate(track, candidates)
+    if song:
+        return song, "search"
+    return None, None
+
+
+def perform_apple_transfer(apple, job, tracks, target, options, stats, dup_preview):
+    unmatched_preview = []
+    existing = {"catalog_ids": set(), "isrcs": set()}
+    target_id = None
+    playlist_name = target.get("name") or ""
+
+    if target["mode"] == "existing":
+        target_id = target["id"]
+        job["message"] = "Lecture de la playlist Apple Music cible…"
+        try:
+            existing = apple.playlist_existing_tracks(target_id)
+        except AppleMusicAuthError:
+            raise
+        except AppleMusicAPIError as exc:
+            if exc.status in (403, 404):
+                raise MergeError(
+                    "Impossible de lire la playlist Apple Music cible. Vérifiez qu'elle existe dans votre bibliothèque."
+                )
+            raise
+        playlist_name = target.get("name") or "Playlist Apple Music"
+
+    cache = {}
+    song_ids = []
+    seen_song_ids = set()
+    total = len(tracks)
+    job["phase"] = "match"
+    job["progress"] = {"done": 0, "total": total}
+
+    for index, track in enumerate(tracks):
+        if job["cancel"]:
+            break
+        cache_key = (
+            track["isrc"].upper()
+            if track.get("isrc")
+            else "{}|{}".format(
+                "|".join(track.get("artists") or []).lower(),
+                track.get("title") or "",
+            )
+        )
+        if cache_key in cache:
+            song, method = cache[cache_key]
+        else:
+            song, method = resolve_apple_song(apple, track)
+            cache[cache_key] = (song, method)
+
+        if song:
+            stats["matched_isrc" if method == "isrc" else "matched_search"] += 1
+            song_id = str(song.get("id"))
+            isrc = (track.get("isrc") or "").upper()
+            already = song_id in existing["catalog_ids"] or (isrc and isrc in existing["isrcs"])
+            if options["dedupe"] and already:
+                stats["already_in_target"] += 1
+            elif options["dedupe"] and song_id in seen_song_ids:
+                stats["duplicates"] += 1
+            else:
+                song_ids.append(song_id)
+                seen_song_ids.add(song_id)
+        else:
+            stats["unmatched"] += 1
+            if len(unmatched_preview) < DUP_PREVIEW_LIMIT:
+                unmatched_preview.append(track["label"])
+
+        job["progress"]["done"] = index + 1
+        if index % 3 == 0 or index + 1 == total:
+            job["message"] = "Recherche sur Apple Music… {}/{} · {} trouvé(s)".format(
+                index + 1, total, len(song_ids)
+            )
+
+    result = {
+        "provider": "apple_music",
+        "created": False,
+        "dry_run": options["dry_run"],
+        "playlist_id": target_id,
+        "playlist_url": apple_playlist_url(target_id) if target_id else None,
+        "playlist_name": playlist_name,
+        "to_add": len(song_ids),
+        "added": 0,
+        "stats": stats,
+        "dup_preview": dup_preview,
+        "unmatched_preview": unmatched_preview,
+    }
+
+    if job["cancel"] or options["dry_run"]:
+        return result
+
+    if target["mode"] == "new":
+        if not song_ids:
+            raise MergeError(
+                "Aucun morceau n'a pu être trouvé sur Apple Music : la playlist serait vide."
+            )
+        job["phase"] = "target"
+        job["message"] = "Création de la playlist « {} » sur Apple Music…".format(
+            target["name"].strip()
+        )
+        created_playlist = apple.create_playlist(
+            target["name"].strip(),
+            (target.get("description") or "").strip(),
+            bool(target.get("public")),
+        )
+        target_id = created_playlist.get("id")
+        if not target_id:
+            raise MergeError("Apple Music n'a pas renvoyé l'identifiant de la playlist créée.")
+        result["created"] = True
+        result["playlist_id"] = target_id
+        result["playlist_url"] = apple_playlist_url(target_id)
+        result["playlist_name"] = (
+            (created_playlist.get("attributes") or {}).get("name")
+            or target["name"]
+        )
+    remaining = song_ids
+
+    job["phase"] = "add"
+    job["progress"] = {"done": job["added"], "total": len(song_ids)}
+    job["message"] = "Ajout des morceaux… {}/{}".format(job["added"], len(song_ids))
+    for batch in chunks(remaining, APPLE_BATCH_SIZE):
+        if job["cancel"]:
+            break
+        apple.add_tracks(target_id, batch)
+        job["added"] += len(batch)
+        job["progress"]["done"] = job["added"]
+        job["message"] = "Ajout des morceaux… {}/{}".format(job["added"], len(song_ids))
+
     result["added"] = job["added"]
     return result
 
